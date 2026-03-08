@@ -1,0 +1,17 @@
+[Unit]
+Description=FRP Request visualization
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/frp_PV
+ExecStart=/root/.local/bin/uv run app.py
+Restart=always
+RestartSec=5
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=frp_pv
+
+[Install]
+WantedBy=multi-user.target

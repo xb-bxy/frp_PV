@@ -1,0 +1,28 @@
+{
+  "frp_log_file": "/root/frp/frp_run.log",
+  "server_location": {
+    "lat": 39.9042,
+    "lng": 116.4074,
+    "name": "北京 (Beijing)"
+  },
+  "web_port": 5508,
+  "web_host": "0.0.0.0",
+  "admin_username": "root",
+  "admin_password_hash": "",
+  "secret_key": "9fe1cf76523fb13e5765bbd317fc174d2f9cbr47d6fa8ace",
+  "arc_lifetime_seconds": 3600,
+  "home_country": "中国",
+  "foreign_highlight": true,
+  "auto_ban": {
+    "enabled": true,
+    "foreign_only": true,
+    "threshold_seconds": 60,
+    "threshold_count": 10,
+    "whitelist_modules": [
+
+    ],
+    "whitelist_ips": [
+      "127.0.0.1"
+    ]
+  }
+}
