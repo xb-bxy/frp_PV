@@ -9,6 +9,7 @@
   "web_host": "0.0.0.0",
   "admin_username": "root",
   "admin_password_hash": "",
+  "frequent_threshold": 200,
   "secret_key": "9fe1cf76523fb13e5765bbd317fc174d2f9cbr47d6fa8ace",
   "arc_lifetime_seconds": 3600,
   "home_country": "中国",

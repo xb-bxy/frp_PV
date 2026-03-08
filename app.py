@@ -1,3 +1,11 @@
+# /// script
+# requires-python = ">=3.9"
+# dependencies = [
+#     "flask",
+#     "flask-socketio",
+#     "requests",
+# ]
+# ///
 
 import os
 import re
@@ -47,36 +55,32 @@ def get_log_file():
 ip_cache = {}    # 缓存已解析的 IP -> 地理信息映射
 ip_connections = defaultdict(list) # 记录 IP 的访问时间戳，用于自动封禁
 locations = []   # 保存用于前端展示的位置列表
-seen_ips = set() # 记录已经处理过的 IP 以防重复
+location_map = {} # 记录 (ip, module) -> dict 进行引用更新
 
-def get_geo(ip, module='unknown'):
-    """通过 ip-api 免费接口获取 IP 的地理位置，带缓存防限流"""
+def get_geo_info(ip):
+    """仅获取IP地理位置信息，带缓存防限流"""
     if ip in ip_cache:
         return ip_cache[ip]
     try:
         # 排除了一些局域网 IP
         if ip.startswith("127.") or ip.startswith("192.168.") or ip.startswith("10.") or ip.startswith("172."):
+            ip_cache[ip] = None
             return None
             
         # 因 ip-api.com 在国内可能被墙，这里改用 ipwho.is 免费接口 + 设置超时防卡死
         res = requests.get(f"http://ipwho.is/{ip}?lang=zh-CN", timeout=5).json()
         if res.get('success') is True:
-            data = {
-                "ip": ip,
+            geo_data = {
                 "lat": res.get("latitude"),
                 "lon": res.get("longitude"),
                 "country": res.get("country", ""),
-                "desc": f"{res.get('country', '')} - {res.get('city', '')}".strip(" - "),
-                "module": module,
-                "time": time.strftime('%Y-%m-%d %H:%M:%S')
+                "desc": f"{res.get('country', '')} - {res.get('city', '')}".strip(" - ")
             }
-            ip_cache[ip] = data
-            locations.append(data)
-            # 通过 WebSocket 实时推送新事件到所有已连接客户端
-            socketio.emit('new_ip', data)
-            return data
+            ip_cache[ip] = geo_data
+            return geo_data
     except Exception as e:
         print(f"Error fetching IP {ip}: {e}")
+    ip_cache[ip] = None
     return None
 
 def watch_log():
@@ -126,14 +130,34 @@ def watch_log():
                             module = match.group(1)
                             ip = match.group(2)
                             
-                            # 1. 尝试获取归属地（如果没见过则请求 API）
-                            geo_data = ip_cache.get(ip)
-                            if not geo_data and ip not in seen_ips:
-                                seen_ips.add(ip)
+                            # 1. 获取归属地并记录模块访问次数
+                            if ip not in ip_cache:
                                 print(f"检测到新 IP: {ip} (模块: {module}), 正在查询地理位置...")
-                                geo_data = get_geo(ip, module)
-                                # 免费版防限流稍微休眠
+                                get_geo_info(ip)
                                 time.sleep(1.5)
+                            
+                            geo_data = ip_cache.get(ip)
+                            
+                            key = (ip, module)
+                            if key not in location_map:
+                                data = {
+                                    "ip": ip,
+                                    "lat": geo_data.get("lat") if geo_data else None,
+                                    "lon": geo_data.get("lon") if geo_data else None,
+                                    "country": geo_data.get("country", "") if geo_data else "",
+                                    "desc": geo_data.get("desc", "") if geo_data else "",
+                                    "module": module,
+                                    "time": time.strftime('%Y-%m-%d %H:%M:%S'),
+                                    "count": 1
+                                }
+                                location_map[key] = data
+                                locations.append(data)
+                                socketio.emit('new_ip', data)
+                            else:
+                                data = location_map[key]
+                                data["count"] = data.get("count", 1) + 1
+                                data["time"] = time.strftime('%Y-%m-%d %H:%M:%S')
+                                socketio.emit('update_ip', data)
                                 
                             # 2. 自动封禁 (Auto Ban) 判定逻辑
                             cfg = _cached_config if _cached_config else config
@@ -225,6 +249,7 @@ def api_settings():
             "data": {
                 "frp_log_file": config.get("frp_log_file", "/root/frp/frp_run.log"),
                 "home_country": config.get("home_country", "中国"),
+                "frequent_threshold": config.get("frequent_threshold", 5),
                 "foreign_highlight": config.get("foreign_highlight", True),
                 "admin_username": config.get("admin_username", "root"),
                 "auto_ban": config.get("auto_ban", {})
@@ -248,13 +273,11 @@ def api_settings():
             return jsonify({"status": "error", "msg": "原密码为空，请留空"})
             
         config['admin_password_hash'] = generate_password_hash(new_password) if new_password else ''
-    
+
     # 常规配置处理
     config['frp_log_file'] = data.get('frp_log_file', config.get('frp_log_file'))
     config['home_country'] = data.get('home_country', config.get('home_country'))
-    config['foreign_highlight'] = data.get('foreign_highlight', config.get('foreign_highlight'))
-    config['admin_username'] = data.get('admin_username', config.get('admin_username'))
-    
+    config['frequent_threshold'] = data.get('frequent_threshold', config.get('frequent_threshold'))
     if 'auto_ban' in data:
         config['auto_ban'] = data['auto_ban']
         

@@ -122,7 +122,7 @@
         .tab-btn.active { color: #3b82f6; border-bottom-color: #3b82f6; }
         .tab-btn:hover:not(.active) { color: #cbd5e1; }
         
-        .tab-content { display: none; flex: 1; flex-direction: column; }
+        .tab-content { display: none; flex: 1; flex-direction: column; min-height: 0; overflow: hidden; }
         .tab-content.active { display: flex; }
 
         .btn-block {
@@ -137,6 +137,7 @@
         .ip-table-wrap {
             flex: 1; overflow-y: auto; margin-top: 14px;
             border: 1px solid #1a1a1a; border-radius: 6px;
+            min-height: 0;
         }
         .ip-table-wrap::-webkit-scrollbar { width: 5px; }
         .ip-table-wrap::-webkit-scrollbar-track { background: #0d0d0d; }
@@ -146,11 +147,12 @@
             table-layout: fixed;
         }
         .ip-table colgroup col:nth-child(1) { width: 52px; }
-        .ip-table colgroup col:nth-child(2) { width: 140px; }
+        .ip-table colgroup col:nth-child(2) { width: 130px; }
         .ip-table colgroup col:nth-child(3) { width: auto; }
-        .ip-table colgroup col:nth-child(4) { width: 22%; }
-        .ip-table colgroup col:nth-child(5) { width: 140px; }
-        .ip-table colgroup col:nth-child(6) { width: 80px; text-align: center; }
+        .ip-table colgroup col:nth-child(4) { width: 20%; }
+        .ip-table colgroup col:nth-child(5) { width: 80px; text-align: center; }
+        .ip-table colgroup col:nth-child(6) { width: 140px; }
+        .ip-table colgroup col:nth-child(7) { width: 80px; text-align: center; }
         .ip-table th {
             text-align: left; padding: 10px 14px; color: #555;
             font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px;
@@ -179,7 +181,7 @@
             flex: 1; overflow-y: auto; margin-top: 14px;
             border: 1px solid #1a1a1a; border-radius: 6px;
             padding: 10px; display: flex; flex-direction: column; gap: 8px;
-            background: #0a0a0a;
+            background: #0a0a0a; min-height: 0;
         }
         #all-logs-stream::-webkit-scrollbar { width: 5px; }
         #all-logs-stream::-webkit-scrollbar-track { background: #0d0d0d; }
@@ -323,12 +325,17 @@
         
         <!-- Tab 1: IP List -->
         <div id="tab-iplist" class="tab-content active">
-            <input class="ip-search" id="ip-search-input" type="text" placeholder="搜索 IP、地区或模块..." oninput="filterIpTable()">
+            <div style="display:flex; gap: 10px; align-items: center;">
+                <input class="ip-search" id="ip-search-input" type="text" placeholder="搜索 IP、地区或模块..." oninput="filterIpTable()" style="flex:1;">
+                <label style="color:#cbd5e1; font-size:13px; display:flex; align-items:center; gap:4px; cursor:pointer; flex-shrink:0;">
+                    <input type="checkbox" id="frequent-filter" onchange="filterIpTable()"> 仅显示频繁请求
+                </label>
+            </div>
             <div class="ip-count-info" id="ip-count-info"></div>
             <div class="ip-table-wrap">
                 <table class="ip-table">
                     <colgroup>
-                        <col><col><col><col><col><col>
+                        <col><col><col><col><col><col><col>
                     </colgroup>
                     <thead>
                         <tr>
@@ -336,7 +343,8 @@
                             <th>IP 地址</th>
                             <th>地区</th>
                             <th>访问模块</th>
-                            <th>首次发现时间</th>
+                            <th>访问次数</th>
+                            <th>最近访问时间</th>
                             <th style="text-align:center">操作</th>
                         </tr>
                     </thead>
@@ -397,6 +405,10 @@
             <div class="m-field">
                 <label>本区标识（所属地区词，影响内/外网判定）</label>
                 <input type="text" id="cfg_home_country">
+            </div>
+            <div class="m-field">
+                <label>列表高频访问阈值（次）</label>
+                <input type="number" id="cfg_frequent_threshold" placeholder="例如: 5">
             </div>
             <div class="m-field" style="display:flex; align-items:center; gap:8px;">
                 <input type="checkbox" id="cfg_foreign_highlight" style="width:auto; margin:0;">
@@ -518,6 +530,7 @@
     const TARGET_LOC = { lat: {{ config.server_location.lat }}, lng: {{ config.server_location.lng }} };
     const ARC_LIFETIME_MS = {{ config.arc_lifetime_seconds | default(3600) }} * 1000;
     const HOME_COUNTRY = "{{ config.home_country | default('中国') }}";
+    const FREQUENT_THRESHOLD = {{ config.get('frequent_threshold', 5) }};
     let foreignHighlight = {{ 'true' if config.get('foreign_highlight', True) else 'false' }};
 
     function isExpired(loc) {
@@ -693,7 +706,25 @@
     socket.on('new_ip', (loc) => {
         allIpData.push(loc);
         updateFromData(allIpData);
+        if (document.getElementById('iplist-modal').classList.contains('active')) {
+            filterIpTable();
+        }
         addLogEntry(loc);
+    });
+
+    socket.on('update_ip', (data) => {
+        let existing = allIpData.find(loc => loc.ip === data.ip && loc.module === data.module);
+        if (existing) {
+            existing.count = data.count;
+            existing.time = data.time;
+            updateFromData(allIpData);
+            // 如果面板打开了，触发刷新表格
+            if (document.getElementById('iplist-modal').classList.contains('active')) {
+                filterIpTable();
+            }
+            // 在侧边栏和日志流添加一条新连接记录
+            addLogEntry({...existing});
+        }
     });
 
     socket.on('sys_log', (data) => {
@@ -704,8 +735,12 @@
         // 过滤掉超过生命周期的条目（仅影响球面显示，allIpData 完整保留）
         const activeData = data.filter(loc => !isExpired(loc)).slice(-60);
 
-        document.getElementById('ip-count').innerText = data.length;
-        document.getElementById('conn-count').innerText = data.length * 3;
+        // 获取精确的排重IP数量 (按IP排重而不是IP+Module)
+        const uniqueIps = new Set(data.map(loc => loc.ip)).size;
+        const totalConns = data.reduce((sum, loc) => sum + (loc.count || 1), 0);
+        
+        document.getElementById('ip-count').innerText = uniqueIps;
+        document.getElementById('conn-count').innerText = totalConns;
 
         attackPointsData = [];
         attackArcsData = [];
@@ -907,11 +942,12 @@
         // reversed so newest at top
         const reversed = [...data].reverse();
         tbody.innerHTML = reversed.map((loc, i) => `
-            <tr title="${loc.ip}">
+            <tr title="${loc.ip}" style="${(loc.count || 1) >= FREQUENT_THRESHOLD ? 'background:rgba(239,68,68,0.15);' : ''}">
                 <td style="color:#555;font-size:12px">${data.length - i}</td>
-                <td><span class="t-ip">${loc.ip}</span></td>
+                <td><span class="t-ip" style="${(loc.count || 1) >= FREQUENT_THRESHOLD ? 'color:#fca5a5;' : ''}">${loc.ip}</span></td>
                 <td title="${loc.desc||''}">${loc.desc || '—'}</td>
                 <td>${loc.module ? `<span class="t-module" title="${loc.module}">${loc.module}</span>` : '<span style="color:#444">—</span>'}</td>
+                <td style="text-align:center; font-weight:bold; color: ${(loc.count || 1) >= FREQUENT_THRESHOLD ? '#ef4444' : '#10b981'};">${loc.count || 1}</td>
                 <td style="color:#64748b;font-size:12px;font-family:ui-monospace,monospace">${loc.time || '—'}</td>
                 <td style="text-align:center"><button class="btn-block" onclick="blockIp('${loc.ip}')">封禁</button></td>
             </tr>
@@ -920,12 +956,19 @@
     }
     function filterIpTable() {
         const q = document.getElementById('ip-search-input').value.toLowerCase();
-        if (!q) { renderIpTable(allIpData); return; }
-        const filtered = allIpData.filter(loc =>
-            (loc.ip||'').toLowerCase().includes(q) ||
-            (loc.desc||'').toLowerCase().includes(q) ||
-            (loc.module||'').toLowerCase().includes(q)
-        );
+        const freqOnly = document.getElementById('frequent-filter').checked;
+        
+        let filtered = allIpData;
+        if (freqOnly) {
+            filtered = filtered.filter(loc => (loc.count || 1) >= FREQUENT_THRESHOLD);
+        }
+        if (q) {
+            filtered = filtered.filter(loc =>
+                (loc.ip||'').toLowerCase().includes(q) ||
+                (loc.desc||'').toLowerCase().includes(q) ||
+                (loc.module||'').toLowerCase().includes(q)
+            );
+        }
         renderIpTable(filtered);
         document.getElementById('ip-count-info').innerText = `共 ${filtered.length} / ${allIpData.length} 条记录`;
     }
@@ -964,6 +1007,7 @@
                     const cfg = res.data;
                     document.getElementById('cfg_log_file').value = cfg.frp_log_file || '';
                     document.getElementById('cfg_home_country').value = cfg.home_country || '';
+                    document.getElementById('cfg_frequent_threshold').value = cfg.frequent_threshold || 5;
                     document.getElementById('cfg_foreign_highlight').checked = !!cfg.foreign_highlight;
                     document.getElementById('cfg_admin_user').value = cfg.admin_username || '';
                     
@@ -1007,6 +1051,7 @@
         const payload = {
             frp_log_file: document.getElementById('cfg_log_file').value.trim(),
             home_country: document.getElementById('cfg_home_country').value.trim(),
+            frequent_threshold: parseInt(document.getElementById('cfg_frequent_threshold').value) || 5,
             foreign_highlight: document.getElementById('cfg_foreign_highlight').checked,
             admin_username: document.getElementById('cfg_admin_user').value.trim() || 'root',
             auto_ban: {
