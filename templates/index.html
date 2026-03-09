@@ -909,10 +909,11 @@
 
     // --- IP List Modal ---
     let allIpData = [];
+    let blockedIps = new Set();
     function openIpList(e) {
         e.preventDefault();
         document.getElementById('ip-search-input').value = '';
-        renderIpTable(allIpData);
+        renderIpTable(allIpData.filter(loc => !blockedIps.has(loc.ip)));
         loadFirewallRules(); // 加载黑名单
         document.getElementById('iplist-modal').classList.add('active');
     }
@@ -966,6 +967,8 @@
             if (res.status === 'success') {
                 const tbody = document.getElementById('firewall-table-body');
                 const data = res.data;
+                blockedIps = new Set(data.map(rule => rule.ip));
+                filterIpTable();
                 document.getElementById('fw-count').innerText = `(${data.length})`;
                 if (data.length === 0) {
                     tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#666;padding:20px;">暂无黑名单规则</td></tr>';
@@ -1009,7 +1012,8 @@
         const q = document.getElementById('ip-search-input').value.toLowerCase();
         const freqOnly = document.getElementById('frequent-filter').checked;
         
-        let filtered = allIpData;
+        const unblockedData = allIpData.filter(loc => !blockedIps.has(loc.ip));
+        let filtered = unblockedData;
         if (freqOnly) {
             filtered = filtered.filter(loc => (loc.count || 1) >= FREQUENT_THRESHOLD);
         }
@@ -1021,7 +1025,7 @@
             );
         }
         renderIpTable(filtered);
-        document.getElementById('ip-count-info').innerText = `共 ${filtered.length} / ${allIpData.length} 条记录`;
+        document.getElementById('ip-count-info').innerText = `共 ${filtered.length} / ${unblockedData.length} 条记录`;
     }
 
     // --- All Logs Modal ---
