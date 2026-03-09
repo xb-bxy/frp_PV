@@ -304,6 +304,10 @@
             <span class="label">独立来源 (IP)</span>
             <span class="value" id="ip-count">0</span>
         </div>
+        <div class="stat-item">
+            <span class="label">活跃连接</span>
+            <span class="value" id="active-count" style="color: #10b981;">0</span>
+        </div>
         <div style="margin-top: 24px; border-top: 1px solid rgba(255,255,255,0.06); padding-top: 16px;">
             <div class="stat-header">最新流入日志</div>
             <div id="log-stream"></div>
@@ -731,6 +735,15 @@
         addSysLogEntry(data.msg, data.type);
     });
 
+    socket.on('connection_opened', (data) => {
+        document.getElementById('active-count').innerText = data.active || 0;
+    });
+
+    socket.on('connection_closed', (data) => {
+        document.getElementById('active-count').innerText = data.active || 0;
+        addDisconnectLogEntry(data);
+    });
+
     function updateFromData(data) {
         // 过滤掉超过生命周期的条目（仅影响球面显示，allIpData 完整保留）
         const activeData = data.filter(loc => !isExpired(loc)).slice(-60);
@@ -828,6 +841,44 @@
         allEntry.className = 'log-entry';
         allEntry.style.background = bgColor;
         allEntry.style.borderLeft = `3px solid ${color}`;
+        allEntry.innerHTML = innerHTML;
+        allLogsStream.insertBefore(allEntry, allLogsStream.firstChild);
+        if (allLogsStream.children.length > 1000) allLogsStream.removeChild(allLogsStream.lastChild);
+    }
+
+    function formatDuration(sec) {
+        if (sec === null || sec === undefined) return '';
+        if (sec < 1) return (sec * 1000).toFixed(0) + 'ms';
+        if (sec < 60) return sec.toFixed(1) + 's';
+        if (sec < 3600) return Math.floor(sec / 60) + 'm ' + Math.floor(sec % 60) + 's';
+        return Math.floor(sec / 3600) + 'h ' + Math.floor((sec % 3600) / 60) + 'm';
+    }
+
+    function addDisconnectLogEntry(data) {
+        let entry = document.createElement('div');
+        entry.className = 'log-entry';
+        entry.style.borderLeftColor = '#10b981';
+        let timeStr = '';
+        if (data.time) {
+            const t = new Date(data.time.replace(' ', 'T'));
+            timeStr = `${t.getHours().toString().padStart(2,'0')}:${t.getMinutes().toString().padStart(2,'0')}:${t.getSeconds().toString().padStart(2,'0')}`;
+        } else {
+            let now = new Date();
+            timeStr = `${now.getHours().toString().padStart(2,'0')}:${now.getMinutes().toString().padStart(2,'0')}:${now.getSeconds().toString().padStart(2,'0')}`;
+        }
+        const moduleBadge = data.module ? `<span class="module-badge" style="background:rgba(16,185,129,0.15);color:#10b981;border-color:rgba(16,185,129,0.3);">${data.module}</span>` : '';
+        const dur = formatDuration(data.duration);
+        const durationBadge = dur ? `<span class="module-badge" style="background:rgba(251,191,36,0.15);color:#fbbf24;border-color:rgba(251,191,36,0.3);">&#9201; ${dur}</span>` : '';
+        const innerHTML = `
+            <div><span class="timestamp" style="color:#10b981">[${timeStr}] 断开</span> <strong>${data.ip}</strong>${moduleBadge}${durationBadge}</div>
+            <span class="geo">${data.desc || ''}</span>
+        `;
+        entry.innerHTML = innerHTML;
+        logStream.insertBefore(entry, logStream.firstChild);
+        if (logStream.children.length > 5) logStream.removeChild(logStream.lastChild);
+        let allEntry = document.createElement('div');
+        allEntry.className = 'log-entry';
+        allEntry.style.borderLeftColor = '#10b981';
         allEntry.innerHTML = innerHTML;
         allLogsStream.insertBefore(allEntry, allLogsStream.firstChild);
         if (allLogsStream.children.length > 1000) allLogsStream.removeChild(allLogsStream.lastChild);
