@@ -11,11 +11,12 @@ import os
 import re
 import time
 import json
+import datetime
 import requests
 from flask import Flask, render_template, jsonify, request, session, redirect, url_for
 from flask_socketio import SocketIO, emit
 from functools import wraps
-from collections import defaultdict
+from collections import defaultdict, deque
 from werkzeug.security import check_password_hash, generate_password_hash
 from threading import Thread
 import subprocess
@@ -56,6 +57,7 @@ ip_cache = {}    # 缓存已解析的 IP -> 地理信息映射
 ip_connections = defaultdict(list) # 记录 IP 的访问时间戳，用于自动封禁
 locations = []   # 保存用于前端展示的位置列表
 location_map = {} # 记录 (ip, module) -> dict 进行引用更新
+active_conns = defaultdict(deque) # module -> deque of {ip, connect_time}，追踪活跃连接
 
 def get_geo_info(ip):
     """仅获取IP地理位置信息，带缓存防限流"""
@@ -83,6 +85,13 @@ def get_geo_info(ip):
     ip_cache[ip] = None
     return None
 
+def parse_log_timestamp(line):
+    """从 frps 日志行中提取精确时间戳"""
+    m = re.match(r'(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}\.\d{3})', line)
+    if m:
+        return datetime.datetime.strptime(m.group(1), '%Y-%m-%d %H:%M:%S.%f')
+    return None
+
 def watch_log():
     """后台监控并解析 frp 日志文件"""
     while True:
@@ -97,8 +106,17 @@ def watch_log():
             print(f"开始监控日志: {current_log_file}")
             try:
                 with open(current_log_file, 'r', encoding='utf-8') as f:
-                    # 移动到文件末尾，只监听新产生的日志
-                    f.seek(0, 2)
+                    # 查找最后一次 frps 启动位置，从该处加载历史连接数据
+                    last_start_pos = f.tell()
+                    while True:
+                        line = f.readline()
+                        if not line:
+                            break
+                        if 'frps uses config file:' in line:
+                            last_start_pos = f.tell()
+                    f.seek(last_start_pos)
+                    print(f"从最近一次 frps 启动记录开始初始化历史数据...")
+                    is_init = True
                     # 记录inode信息，检查是否被轮换或修改路径
                     current_ino = os.fstat(f.fileno()).st_ino
                     
@@ -110,7 +128,11 @@ def watch_log():
                             
                         line = f.readline()
                         if not line:
-                            time.sleep(1) # 没有新数据时休眠一下
+                            if is_init:
+                                is_init = False
+                                active = sum(len(q) for q in active_conns.values())
+                                print(f"历史数据初始化完成: {len(locations)} 条 IP 记录, 活跃连接 {active}")
+                            time.sleep(1)
                             
                             # 检查文件是否被重建或轮转
                             try:
@@ -134,7 +156,7 @@ def watch_log():
                             if ip not in ip_cache:
                                 print(f"检测到新 IP: {ip} (模块: {module}), 正在查询地理位置...")
                                 get_geo_info(ip)
-                                time.sleep(1.5)
+                                time.sleep(0.3 if is_init else 1.5)
                             
                             geo_data = ip_cache.get(ip)
                             
@@ -198,6 +220,45 @@ def watch_log():
                                             
                                         # 清空记录避免该IP紧接着无意义的连续触发拉黑命令
                                         history.clear()
+
+                        # 3. 连接建立追踪
+                        join_match = re.search(
+                            r'\[([^\]]+)\] join connections, workConn\(.*?\) userConn\(.*?r\[([^\]]+):\d+\]\)',
+                            line
+                        )
+                        if join_match:
+                            j_module = join_match.group(1)
+                            j_ip = join_match.group(2)
+                            j_ts = parse_log_timestamp(line)
+                            active_conns[j_module].append({'ip': j_ip, 'connect_time': j_ts})
+                            socketio.emit('connection_opened', {
+                                'module': j_module, 'ip': j_ip,
+                                'active': sum(len(q) for q in active_conns.values())
+                            })
+
+                        # 4. 连接断开追踪 (计算持续时长)
+                        close_match = re.search(r'\[([^\]]+)\] join connections closed', line)
+                        if close_match:
+                            c_module = close_match.group(1)
+                            duration = None
+                            c_ip = None
+                            if active_conns[c_module]:
+                                conn = active_conns[c_module].popleft()
+                                c_ip = conn['ip']
+                                c_ts = parse_log_timestamp(line)
+                                if c_ts and conn.get('connect_time'):
+                                    duration = (c_ts - conn['connect_time']).total_seconds()
+                            geo = ip_cache.get(c_ip) if c_ip else None
+                            socketio.emit('connection_closed', {
+                                'ip': c_ip or '未知',
+                                'module': c_module,
+                                'duration': round(duration, 3) if duration is not None else None,
+                                'time': time.strftime('%Y-%m-%d %H:%M:%S'),
+                                'desc': geo.get('desc', '') if geo else '',
+                                'country': geo.get('country', '') if geo else '',
+                                'active': sum(len(q) for q in active_conns.values())
+                            })
+
             except Exception as e:
                 print(f"读取日志文件遇到错误: {e}")
                 time.sleep(5)
