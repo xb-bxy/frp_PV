@@ -1,5 +1,4 @@
 {
-  "frp_log_file": "/root/frp/frp_run.log",
   "server_location": {
     "lat": 39.9042,
     "lng": 116.4074,
@@ -25,5 +24,6 @@
     "whitelist_ips": [
       "127.0.0.1"
     ]
-  }
+  },
+  "banned_ips": []
 }

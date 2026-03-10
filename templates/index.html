@@ -4,281 +4,22 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>FRP 全球态势感知</title>
-    <!-- 引入核心 3D 库 (去除了 topojson 依赖，完全剥离多边形渲染) -->
+    <!-- 核心 3D 库 -->
     <script src="{{ url_for('static', filename='js/three.min.js') }}"></script>
     <script src="{{ url_for('static', filename='js/globe.gl.min.js') }}"></script>
     <script src="{{ url_for('static', filename='js/socket.io.min.js') }}"></script>
-    
-    <style>
-        body, html {
-            margin: 0; padding: 0; width: 100vw; height: 100vh;
-            background-color: #030305;
-            font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
-            overflow: hidden; color: #e2e8f0;
-        }
-
-        #globe-container { width: 100vw; height: 100vh; cursor: grab; }
-        #globe-container:active { cursor: grabbing; }
-
-        #ui-panel {
-            position: absolute; top: 40px; right: 40px; width: 330px;
-            background: rgba(15, 20, 25, 0.45);
-            backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
-            border: 1px solid rgba(255, 255, 255, 0.08);
-            padding: 16px 20px; border-radius: 16px;
-            pointer-events: none; z-index: 10;
-            transition: all 0.3s ease;
-        }
-        #ui-panel.collapsed .panel-header { display: none; }
-        #ui-panel.collapsed #panel-body { display: none; }
-        #ui-panel.collapsed { width: 46px; padding: 0; border-radius: 12px; }
-        #ui-panel.collapsed .panel-restore-btn { display: flex; }
-
-        .panel-restore-btn {
-            display: none;
-            width: 46px; height: 46px;
-            align-items: center; justify-content: center;
-            cursor: pointer; background: none; border: none;
-            color: #94a3b8; font-size: 20px; pointer-events: auto;
-            border-radius: 12px;
-        }
-        .panel-restore-btn:hover { color: #fff; background: rgba(255,255,255,0.06); }
-
-        .panel-header {
-            display: flex; flex-direction: column; gap: 12px;
-            margin-bottom: 16px; padding-bottom: 12px;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-            pointer-events: auto;
-        }
-        .panel-head-top {
-            display: flex; align-items: center; justify-content: space-between; width: 100%;
-        }
-        .panel-title {
-            display: flex; align-items: center; gap: 8px;
-            font-size: 14px; font-weight: 500; color: #94a3b8;
-        }
-        .panel-title::before {
-            content: ''; display: block; width: 6px; height: 6px;
-            background-color: #3b82f6; border-radius: 50%;
-        }
-        .panel-actions { display: flex; gap: 8px; flex-wrap: wrap; }
-        .panel-controls { display: flex; gap: 6px; }
-        .panel-btn {
-            background: rgba(255,255,255,0.06); border: none; color: #94a3b8;
-            border-radius: 5px; padding: 3px 8px; font-size: 12px; cursor: pointer;
-            transition: all 0.2s; font-family: inherit;
-        }
-        .panel-btn:hover { background: rgba(255,255,255,0.12); color: #fff; }
-
-        #ui-panel .stat-header {
-            font-size: 13px; font-weight: 500; color: #94a3b8;
-            margin: 0 0 12px 0;
-        }
-        .stat-item {
-            display: flex; justify-content: space-between; align-items: baseline; margin: 16px 0;
-        }
-        .stat-item span.label { font-size: 13px; color: #cbd5e1; font-weight: 400; }
-        .stat-item span.value {
-            font-size: 26px; font-weight: 300; color: #ffffff;
-            font-family: inherit;
-        }
-
-        #log-stream {
-            margin-top: 28px; max-height: 300px; overflow-y: hidden;
-            display: flex; flex-direction: column; gap: 8px;
-        }
-
-        .log-entry {
-            font-size: 12.5px; line-height: 1.4; color: #f1f5f9;
-            background: rgba(255, 255, 255, 0.04); padding: 10px 14px;
-            border-radius: 8px; border-left: 2px solid #3b82f6;
-            animation: slideIn 0.3s ease-out;
-            word-wrap: break-word;
-        }
-
-        .log-entry .timestamp { color: #64748b; font-size: 11px; margin-right: 6px; font-family: ui-monospace, monospace; }
-        .log-entry .geo { color: #94a3b8; font-size: 11px; display: block; margin-top: 4px; }
-        .log-entry .module-badge {
-            display: inline-block; background: rgba(59,130,246,0.15); color: #60a5fa;
-            border: 1px solid rgba(59,130,246,0.3); border-radius: 4px;
-            font-size: 10px; padding: 1px 6px; margin-left: 6px; vertical-align: middle;
-            font-family: ui-monospace, monospace;
-        }
-
-        /* IP List & Access Control Modal */
-        .ip-modal-box {
-            width: 90vw !important; max-width: 1100px;
-            height: 82vh; display: flex; flex-direction: column;
-        }
-        .tabs-header {
-            display: flex; gap: 16px; margin-top: -10px; margin-bottom: 12px;
-            border-bottom: 1px solid #1f1f1f; padding-bottom: 4px;
-        }
-        .tab-btn {
-            background: none; border: none; font-size: 14px; color: #64748b;
-            cursor: pointer; padding: 8px 12px; border-bottom: 2px solid transparent;
-            font-weight: 500;
-        }
-        .tab-btn.active { color: #3b82f6; border-bottom-color: #3b82f6; }
-        .tab-btn:hover:not(.active) { color: #cbd5e1; }
-        
-        .tab-content { display: none; flex: 1; flex-direction: column; min-height: 0; overflow: hidden; }
-        .tab-content.active { display: flex; }
-
-        .btn-block {
-            background: #ef4444; color: white; border: none;
-            padding: 3px 8px; border-radius: 4px; font-size: 11px; cursor: pointer;
-        }
-        .btn-unblock {
-            background: #10b981; color: white; border: none;
-            padding: 3px 8px; border-radius: 4px; font-size: 11px; cursor: pointer;
-        }
-        
-        .ip-table-wrap {
-            flex: 1; overflow-y: auto; margin-top: 14px;
-            border: 1px solid #1a1a1a; border-radius: 6px;
-            min-height: 0;
-        }
-        .ip-table-wrap::-webkit-scrollbar { width: 5px; }
-        .ip-table-wrap::-webkit-scrollbar-track { background: #0d0d0d; }
-        .ip-table-wrap::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
-        .ip-table {
-            width: 100%; border-collapse: collapse; font-size: 13px;
-            table-layout: fixed;
-        }
-        .ip-table colgroup col:nth-child(1) { width: 52px; }
-        .ip-table colgroup col:nth-child(2) { width: 130px; }
-        .ip-table colgroup col:nth-child(3) { width: auto; }
-        .ip-table colgroup col:nth-child(4) { width: 20%; }
-        .ip-table colgroup col:nth-child(5) { width: 80px; text-align: center; }
-        .ip-table colgroup col:nth-child(6) { width: 140px; }
-        .ip-table colgroup col:nth-child(7) { width: 80px; text-align: center; }
-        .ip-table th {
-            text-align: left; padding: 10px 14px; color: #555;
-            font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px;
-            border-bottom: 1px solid #1f1f1f; font-weight: 600;
-            position: sticky; top: 0; background: #0d0d0d; z-index: 1;
-        }
-        .ip-table td {
-            padding: 11px 14px; border-bottom: 1px solid #111; color: #cbd5e1;
-            overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-        }
-        .ip-table tr:last-child td { border-bottom: none; }
-        .ip-table tr:hover td { background: rgba(255,255,255,0.03); }
-        .ip-table td .t-module {
-            background: rgba(59,130,246,0.1); color: #60a5fa;
-            border-radius: 3px; padding: 2px 8px; font-size: 12px;
-            font-family: ui-monospace, monospace; white-space: nowrap; display: inline-block;
-            max-width: 100%; overflow: hidden; text-overflow: ellipsis; vertical-align: middle;
-        }
-        .ip-table td .t-ip { font-family: ui-monospace, monospace; color: #f1f5f9; font-size: 13px; }
-        
-        /* All Logs Modal */
-        #all-logs-modal .ip-modal-box {
-            width: 70vw !important; max-width: 800px;
-        }
-        #all-logs-stream {
-            flex: 1; overflow-y: auto; margin-top: 14px;
-            border: 1px solid #1a1a1a; border-radius: 6px;
-            padding: 10px; display: flex; flex-direction: column; gap: 8px;
-            background: #0a0a0a; min-height: 0;
-        }
-        #all-logs-stream::-webkit-scrollbar { width: 5px; }
-        #all-logs-stream::-webkit-scrollbar-track { background: #0d0d0d; }
-        #all-logs-stream::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
-        .ip-search {
-            width: 100%; padding: 9px 12px; background: #111; border: 1px solid #222;
-            color: #e2e8f0; border-radius: 6px; font-size: 13px; outline: none;
-            box-sizing: border-box; font-family: inherit; flex-shrink: 0;
-        }
-        .ip-search:focus { border-color: #3b82f6; }
-        .ip-count-info { font-size: 12px; color: #555; margin-top: 8px; flex-shrink: 0; }
-
-        @keyframes slideIn {
-            from { opacity: 0; transform: translateX(10px); }
-            to { opacity: 1; transform: translateX(0); }
-        }
-
-        .overlay-logo {
-            position: absolute; top: 45px; left: 50px; color: #ffffff;
-            font-size: 24px; font-weight: 600; letter-spacing: 1px;
-            z-index: 10; pointer-events: none;
-        }
-
-        .ws-status-row {
-            font-size: 13px; font-weight: 400; color: #94a3b8;
-            display: flex; align-items: center; flex-direction: row;
-            margin-top: 8px; letter-spacing: 0.5px; line-height: 1;
-        }
-
-        .live-indicator {
-            display: inline-block; width: 8px; height: 8px; background: #10b981;
-            border-radius: 50%; box-shadow: 0 0 8px #10b981;
-            animation: pulse 2s infinite; margin-right: 8px;
-            transition: background 0.5s, box-shadow 0.5s;
-        }
-        .live-indicator.disconnected {
-            background: #ef4444; box-shadow: 0 0 8px #ef4444; animation: none;
-        }
-        .live-indicator.connecting {
-            background: #f59e0b; box-shadow: 0 0 8px #f59e0b;
-        }
-
-        @keyframes pulse {
-            0% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.4); }
-            70% { box-shadow: 0 0 0 6px rgba(16, 185, 129, 0); }
-            100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
-        }
-
-        /* Settings Modal */
-        .modal-overlay {
-            position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
-            background: rgba(0,0,0,0.7); backdrop-filter: blur(6px);
-            display: flex; justify-content: center; align-items: center;
-            z-index: 100; opacity: 0; pointer-events: none;
-            transition: opacity 0.25s ease;
-        }
-        .modal-overlay.active { opacity: 1; pointer-events: auto; }
-        .modal-box {
-            width: 320px; background: #0d0d0d; border: 1px solid #222;
-            border-radius: 10px; padding: 28px;
-            transform: translateY(10px); transition: transform 0.25s ease;
-        }
-        .modal-overlay.active .modal-box { transform: translateY(0); }
-        .modal-head {
-            display: flex; justify-content: space-between; align-items: center;
-            margin-bottom: 22px; border-bottom: 1px solid #1f1f1f; padding-bottom: 14px;
-        }
-        .modal-head h3 { margin: 0; font-size: 15px; font-weight: 500; color: #fff; }
-        .modal-head button { background: none; border: none; color: #555; font-size: 22px; cursor: pointer; line-height: 1; padding: 0; }
-        .modal-head button:hover { color: #fff; }
-        .m-field { margin-bottom: 20px; }
-        .m-field label { display: block; font-size: 11px; color: #666; margin-bottom: 7px; text-transform: uppercase; letter-spacing: 0.5px; }
-        .m-field input {
-            width: 100%; padding: 9px 0; font-size: 14px; color: #e2e8f0;
-            border: none; border-bottom: 1px solid #2a2a2a; outline: none;
-            background: transparent; transition: border-color 0.2s; box-sizing: border-box;
-        }
-        .m-field input:focus { border-bottom-color: #fff; }
-        .modal-msg { font-size: 12px; text-align: center; min-height: 16px; margin-bottom: 16px; }
-        .modal-actions { display: flex; gap: 10px; margin-top: 22px; }
-        .modal-actions a, .modal-actions button {
-            flex: 1; padding: 10px; font-size: 13px; text-align: center;
-            border-radius: 5px; cursor: pointer; text-decoration: none;
-            border: none; transition: opacity 0.2s; font-family: inherit;
-        }
-        .modal-actions a { background: #1a1a1a; color: #ef4444; }
-        .modal-actions button { background: #fff; color: #000; }
-        .modal-actions a:hover, .modal-actions button:hover { opacity: 0.75; }
-    </style>
+    <!-- 主样式 -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/main.css') }}">
 </head>
 <body>
 
+<!-- ── Logo & 连接状态 ──────────────────────────────── -->
 <div class="overlay-logo">
     FRP 访问态势感知
     <div class="ws-status-row"><i class="live-indicator connecting" id="ws-indicator"></i><span id="ws-status">服务连接中...</span></div>
 </div>
 
+<!-- ── 侧边面板 ─────────────────────────────────────── -->
 <div id="ui-panel">
     <button class="panel-restore-btn" onclick="togglePanel()" title="展开面板">&#9992;</button>
     <div class="panel-header">
@@ -295,7 +36,7 @@
             <button class="panel-btn" id="highlight-btn" onclick="toggleForeignHighlight()" title="境外高亮">&#127988; 境外高亮</button>
         </div>
     </div>
-    <div id="panel-body">
+    <div id="panel-body" style="pointer-events: auto;">
         <div class="stat-item">
             <span class="label">累计连接频次</span>
             <span class="value" id="conn-count">0</span>
@@ -306,7 +47,11 @@
         </div>
         <div class="stat-item">
             <span class="label">活跃连接</span>
-            <span class="value" id="active-count" style="color: #10b981;">0</span>
+            <span class="value" id="active-count" style="color: #10b981; cursor:pointer; text-decoration: underline dotted; text-underline-offset: 4px;" onclick="openActiveConns()" title="点击查看详情">0</span>
+        </div>
+        <div class="stat-item">
+            <span class="label">已拦截</span>
+            <span class="value" id="blocked-count" style="color: #ef4444; cursor:pointer; text-decoration: underline dotted; text-underline-offset: 4px;" onclick="openBlockedModal()" title="点击查看详情">0</span>
         </div>
         <div style="margin-top: 24px; border-top: 1px solid rgba(255,255,255,0.06); padding-top: 16px;">
             <div class="stat-header">最新流入日志</div>
@@ -315,7 +60,7 @@
     </div>
 </div>
 
-<!-- IP List & Access Control Modal -->
+<!-- ── IP 列表 & 访问控制弹窗 ───────────────────────── -->
 <div id="iplist-modal" class="modal-overlay">
     <div class="modal-box ip-modal-box">
         <div class="modal-head">
@@ -324,9 +69,8 @@
         </div>
         <div class="tabs-header">
             <button class="tab-btn active" onclick="switchTab('tab-iplist')">访问 IP 列表</button>
-            <button class="tab-btn" onclick="switchTab('tab-firewall')">防火墙黑名单 <span id="fw-count" style="font-size:12px;color:#ef4444"></span></button>
+            <button class="tab-btn" onclick="switchTab('tab-firewall')">封禁名单 <span id="fw-count" style="font-size:12px;color:#ef4444"></span></button>
         </div>
-        
         <!-- Tab 1: IP List -->
         <div id="tab-iplist" class="tab-content active">
             <div style="display:flex; gap: 10px; align-items: center;">
@@ -338,39 +82,26 @@
             <div class="ip-count-info" id="ip-count-info"></div>
             <div class="ip-table-wrap">
                 <table class="ip-table">
-                    <colgroup>
-                        <col><col><col><col><col><col><col>
-                    </colgroup>
+                    <colgroup><col><col><col><col><col><col><col></colgroup>
                     <thead>
                         <tr>
-                            <th>#</th>
-                            <th>IP 地址</th>
-                            <th>地区</th>
-                            <th>访问模块</th>
-                            <th>访问次数</th>
-                            <th>最近访问时间</th>
-                            <th style="text-align:center">操作</th>
+                            <th>#</th><th>IP 地址</th><th>地区</th><th>访问模块</th>
+                            <th>访问次数</th><th>最近访问时间</th><th style="text-align:center">操作</th>
                         </tr>
                     </thead>
                     <tbody id="ip-table-body"></tbody>
                 </table>
             </div>
         </div>
-        
         <!-- Tab 2: Firewall -->
         <div id="tab-firewall" class="tab-content">
             <div class="ip-table-wrap" style="margin-top:0">
                 <table class="ip-table">
                     <colgroup>
-                        <col style="width: 80px"><col style="width: 200px"><col><col style="width: 100px">
+                        <col style="width: 60px"><col style="width: 180px"><col><col style="width: 100px">
                     </colgroup>
                     <thead>
-                        <tr>
-                            <th>规则号</th>
-                            <th>阻断 IP 地址</th>
-                            <th>动作</th>
-                            <th style="text-align:center">操作</th>
-                        </tr>
+                        <tr><th>#</th><th>封禁 IP</th><th>归属地</th><th style="text-align:center">操作</th></tr>
                     </thead>
                     <tbody id="firewall-table-body"></tbody>
                 </table>
@@ -379,7 +110,51 @@
     </div>
 </div>
 
-<!-- All Logs Modal -->
+<!-- ── 活跃连接弹窗 ─────────────────────────────────── -->
+<div id="active-modal" class="modal-overlay">
+    <div class="modal-box ip-modal-box" style="max-width:900px;">
+        <div class="modal-head">
+            <h3>活跃连接 <span id="active-modal-count" style="font-size:13px; color:#10b981; font-weight:400;"></span></h3>
+            <button onclick="closeActiveConns()">×</button>
+        </div>
+        <div class="ip-table-wrap" style="margin-top:0">
+            <table class="ip-table" id="active-table">
+                <colgroup>
+                    <col style="width:50px"><col style="width:150px"><col><col style="width:140px"><col style="width:80px"><col style="width:110px">
+                </colgroup>
+                <thead>
+                    <tr><th>#</th><th>IP 地址</th><th>地区</th><th>代理模块</th><th style="text-align:center">连接数</th><th style="text-align:center">持续时间</th></tr>
+                </thead>
+                <tbody id="active-table-body"></tbody>
+            </table>
+        </div>
+        <div style="margin-top:10px; font-size:12px; color:#555;">悬浮连接数查看各端口详情 · 每秒自动刷新</div>
+    </div>
+</div>
+
+<!-- ── 拦截记录弹窗 ─────────────────────────────────── -->
+<div id="blocked-modal" class="modal-overlay">
+    <div class="modal-box ip-modal-box" style="max-width:900px;">
+        <div class="modal-head">
+            <h3>拦截记录 <span id="blocked-modal-count" style="font-size:13px; color:#ef4444; font-weight:400;"></span></h3>
+            <button onclick="closeBlockedModal()">×</button>
+        </div>
+        <div class="ip-table-wrap" style="margin-top:0">
+            <table class="ip-table" id="blocked-table">
+                <colgroup>
+                    <col style="width:50px"><col style="width:150px"><col><col style="width:140px"><col style="width:100px"><col style="width:130px">
+                </colgroup>
+                <thead>
+                    <tr><th>#</th><th>IP 地址</th><th>地区</th><th>代理模块</th><th>原因</th><th>时间</th></tr>
+                </thead>
+                <tbody id="blocked-table-body"></tbody>
+            </table>
+        </div>
+        <div style="margin-top:10px; font-size:12px; color:#555;">最近 200 条拦截记录 · 最新在下方</div>
+    </div>
+</div>
+
+<!-- ── 全部日志弹窗 ─────────────────────────────────── -->
 <div id="all-logs-modal" class="modal-overlay">
     <div class="modal-box ip-modal-box">
         <div class="modal-head">
@@ -390,7 +165,7 @@
     </div>
 </div>
 
-<!-- Settings Modal -->
+<!-- ── 设置弹窗 ─────────────────────────────────────── -->
 <div id="settings-modal" class="modal-overlay">
     <div class="modal-box" style="width: 480px; max-height: 85vh; display: flex; flex-direction: column; overflow: hidden;">
         <div class="modal-head">
@@ -398,14 +173,9 @@
             <button onclick="closeSettings()">×</button>
         </div>
         <div id="modal-msg" class="modal-msg"></div>
-        
         <div style="flex: 1; overflow-y: auto; padding-right: 8px; margin-bottom: 20px;">
             <!-- 基础配置 -->
             <div style="color: #3b82f6; font-size: 13px; font-weight: 600; margin-bottom: 10px; border-bottom: 1px solid #1f1f1f; padding-bottom: 6px;">基础参数</div>
-            <div class="m-field">
-                <label>FRP日志路径</label>
-                <input type="text" id="cfg_log_file">
-            </div>
             <div class="m-field">
                 <label>本区标识（所属地区词，影响内/外网判定）</label>
                 <input type="text" id="cfg_home_country">
@@ -418,16 +188,15 @@
                 <input type="checkbox" id="cfg_foreign_highlight" style="width:auto; margin:0;">
                 <label style="margin:0; text-transform:none;">开启境外(非本区) IP 红色高亮与连线</label>
             </div>
-            
-            <!-- 自动防御 (Auto Ban) -->
+            <!-- 自动防御 -->
             <div style="color: #3b82f6; font-size: 13px; font-weight: 600; margin: 30px 0 10px 0; border-bottom: 1px solid #1f1f1f; padding-bottom: 6px;">主动防御 (Auto Ban)</div>
             <div class="m-field" style="display:flex; align-items:center; gap:8px;">
                 <input type="checkbox" id="cfg_ban_enabled" style="width:auto; margin:0;">
-                <label style="margin:0; text-transform:none;">启用 iptables 高频扫描自动阻断</label>
+                <label style="margin:0; text-transform:none;">启用 frp 层高频自动拦截</label>
             </div>
             <div class="m-field" style="display:flex; align-items:center; gap:8px;">
                 <input type="checkbox" id="cfg_ban_foreign_only" style="width:auto; margin:0;">
-                <label style="margin:0; text-transform:none;">防火墙仅封锁境外(非本区) IP</label>
+                <label style="margin:0; text-transform:none;">仅拦截境外(非本区) IP</label>
             </div>
             <div style="display:flex; gap:16px;">
                 <div class="m-field" style="flex:1;">
@@ -447,7 +216,6 @@
                 <label>豁免白名单 IP (每行一个 IP 地址，永远信任不封禁)</label>
                 <textarea id="cfg_ban_ips" rows="3" style="width:100%; box-sizing:border-box; background:rgba(255,255,255,0.03); border:1px solid #2a2a2a; color:#e2e8f0; font-family:ui-monospace, monospace; padding:10px; border-radius:6px; resize:vertical; font-size: 12px;"></textarea>
             </div>
-            
             <!-- 账户安全 -->
             <div style="color: #3b82f6; font-size: 13px; font-weight: 600; margin: 30px 0 10px 0; border-bottom: 1px solid #1f1f1f; padding-bottom: 6px;">账户安管</div>
             <div class="m-field">
@@ -473,7 +241,6 @@
                 </div>
             </div>
         </div>
-        
         <div class="modal-actions" style="margin-top:0">
             <a href="/logout">登出帐号</a>
             <button onclick="saveSettings()">应用并保存</button>
@@ -481,7 +248,7 @@
     </div>
 </div>
 
-<!-- Custom Alert/Confirm Modal -->
+<!-- ── 自定义对话框 ─────────────────────────────────── -->
 <div id="custom-dialog-modal" class="modal-overlay" style="z-index: 99999;">
     <div class="modal-box" style="width: 330px; text-align: center; padding: 24px;">
         <h3 id="cd-title" style="margin: 0 0 16px 0; font-size: 16px; font-weight: 500; color: #fff;">确认</h3>
@@ -493,653 +260,23 @@
     </div>
 </div>
 
+<div id="port-tooltip"></div>
 <div id="globe-container"></div>
 
+<!-- ── Jinja 配置注入 (仅此处依赖模板引擎) ───────── -->
 <script>
-    const customDialog = {
-        show(options) {
-            document.getElementById('cd-title').innerText = options.title || '提示';
-            document.getElementById('cd-msg').innerHTML = options.msg || '';
-            const cancelBtn = document.getElementById('cd-cancel-btn');
-            const confirmBtn = document.getElementById('cd-confirm-btn');
-            const modal = document.getElementById('custom-dialog-modal');
-            
-            if (options.type === 'confirm') {
-                cancelBtn.style.display = 'block';
-                cancelBtn.onclick = () => {
-                    modal.classList.remove('active');
-                    if (options.onCancel) options.onCancel();
-                };
-            } else {
-                cancelBtn.style.display = 'none';
-            }
-            
-            confirmBtn.onclick = () => {
-                modal.classList.remove('active');
-                if (options.onConfirm) options.onConfirm();
-            };
-            
-            modal.classList.add('active');
-        },
-        alert(msg, callback) {
-            this.show({ title: '提示', msg: msg, type: 'alert', onConfirm: callback });
-        },
-        confirm(msg, onConfirm, onCancel) {
-            this.show({ title: '操作确认', msg: msg, type: 'confirm', onConfirm: onConfirm, onCancel: onCancel });
-        }
+    window.APP_CONFIG = {
+        serverLat: {{ config.server_location.lat }},
+        serverLng: {{ config.server_location.lng }},
+        arcLifetime: {{ config.arc_lifetime_seconds | default(3600) }},
+        homeCountry: "{{ config.home_country | default('中国') }}",
+        frequentThreshold: {{ config.get('frequent_threshold', 5) }},
+        foreignHighlight: {{ 'true' if config.get('foreign_highlight', True) else 'false' }},
+        globeImageUrl: "{{ url_for('static', filename='img/earth-blue-marble.jpg') }}"
     };
-
-    const PRIMARY_COLOR = '#3b82f6';
-    const TARGET_COLOR = '#ffffff';
-    const TARGET_LOC = { lat: {{ config.server_location.lat }}, lng: {{ config.server_location.lng }} };
-    const ARC_LIFETIME_MS = {{ config.arc_lifetime_seconds | default(3600) }} * 1000;
-    const HOME_COUNTRY = "{{ config.home_country | default('中国') }}";
-    const FREQUENT_THRESHOLD = {{ config.get('frequent_threshold', 5) }};
-    let foreignHighlight = {{ 'true' if config.get('foreign_highlight', True) else 'false' }};
-
-    function isExpired(loc) {
-        if (!loc.time || ARC_LIFETIME_MS <= 0) return false;
-        const t = new Date(loc.time.replace(' ', 'T'));
-        return (Date.now() - t.getTime()) > ARC_LIFETIME_MS;
-    }
-
-    // 创建内置发光光晕材质以替代高耗能的内置圆柱体
-    const txLoader = new THREE.TextureLoader();
-    // 使用通过代码生成的简易亮斑材质来代替几何体，极大降低DrawCall
-    const canvas = document.createElement('canvas');
-    canvas.width = 64; canvas.height = 64;
-    const context = canvas.getContext('2d');
-    const gradient = context.createRadialGradient(32, 32, 0, 32, 32, 32);
-    gradient.addColorStop(0, 'rgba(255,255,255,1)');
-    gradient.addColorStop(0.2, 'rgba(59, 130, 246, 1)');
-    gradient.addColorStop(0.5, 'rgba(59, 130, 246, 0.5)');
-    gradient.addColorStop(1, 'rgba(0,0,0,0)');
-    context.fillStyle = gradient;
-    context.fillRect(0, 0, 64, 64);
-    const particleTexture = new THREE.CanvasTexture(canvas);
-
-    const globeContainer = document.getElementById('globe-container');
-    const world = Globe()
-        (globeContainer)
-        // 核心改动：抛弃纯黑贴图和所有的 Polygon，直接使用包含高清国家边界与政治版图名称的内建大贴图！
-        // 这张贴图本身就在图片上带有深蓝色的底纹以及所有的国界线，是一张静态图片，0运算成本！！
-        .globeImageUrl("{{ url_for('static', filename='img/earth-blue-marble.jpg') }}")
-        .backgroundColor('#030305')
-        .atmosphereAltitude(0.12)
-        
-        // --- 完全抛弃基于网格运算的 point 组件 ---
-        // 使用 Three.js 自定义 Sprite (精灵贴图) 来呈现访客点，其渲染成本比计算 3D 柱状球体低 100 倍！
-        .customLayerData([])
-        .customThreeObject(d => {
-            const group = new THREE.Group();
-            
-            const foreign = foreignHighlight && !d.isTarget && d.country && d.country !== HOME_COUNTRY;
-            const material = new THREE.SpriteMaterial({ 
-                map: particleTexture, 
-                color: d.isTarget ? 0xffffff : (foreign ? 0xff4444 : 0x3b82f6),
-                transparent: true,
-                blending: THREE.AdditiveBlending 
-            });
-            const sprite = new THREE.Sprite(material);
-            sprite.scale.set(d.isTarget ? 4 : 2.5, d.isTarget ? 4 : 2.5, 1);
-            group.add(sprite);
-
-            // 如果有名称且不是目标点，则在精灵上方绘制文字
-            if (!d.isTarget && d.desc) {
-                const textCanvas = document.createElement('canvas');
-                // 提高分辨率以保证文字清晰度
-                textCanvas.width = 512;
-                textCanvas.height = 128;
-                const ctx = textCanvas.getContext('2d');
-                ctx.font = 'bold 36px "Microsoft YaHei", sans-serif';
-                ctx.fillStyle = foreign ? '#ff6666' : '#93c5fd';
-                ctx.textAlign = 'center';
-                ctx.textBaseline = 'middle';
-                // d.desc 格式为 "国家 - 城市"
-                ctx.fillText(d.desc.replace(' - ', ' '), 256, 64);
-                
-                const textTexture = new THREE.CanvasTexture(textCanvas);
-                textTexture.minFilter = THREE.LinearFilter;
-                
-                const textMaterial = new THREE.SpriteMaterial({ 
-                    map: textTexture, 
-                    transparent: true,
-                    depthTest: false // 防止被地球模型遮挡
-                });
-                const textSprite = new THREE.Sprite(textMaterial);
-                // 文字的位置要在光点稍微偏上一点，并缩放比例
-                textSprite.position.set(0, 1.8, 0); 
-                textSprite.scale.set(10, 2.5, 1);
-                group.add(textSprite);
-            }
-
-            return group;
-        })
-        .customThreeObjectUpdate((obj, d) => {
-            // 将点附着在地表坐标
-            Object.assign(obj.position, world.getCoords(d.lat, d.lng, 0.01));
-        })
-        
-        // 降低涟漪频率与消耗
-        .ringColor(d => foreignHighlight && d.country && d.country !== HOME_COUNTRY
-            ? `rgba(239, 68, 68, 0.5)`
-            : `rgba(59, 130, 246, 0.4)`
-        )
-        .ringMaxRadius(2)
-        .ringPropagationSpeed(1.5)
-        .ringRepeatPeriod(2000)
-        .ringResolution(12)
-
-        .arcStartLat(d => d.lat)
-        .arcStartLng(d => d.lng)
-        .arcEndLat(d => TARGET_LOC.lat)
-        .arcEndLng(d => TARGET_LOC.lng)
-        .arcColor(d => {
-            const isForeign = foreignHighlight && d.country && d.country !== HOME_COUNTRY;
-            if (d.arcType === 'base') {
-                return isForeign 
-                    ? ['rgba(239, 68, 68, 0.1)', 'rgba(239, 68, 68, 0.5)']
-                    : ['rgba(59, 130, 246, 0.1)', 'rgba(59, 130, 246, 0.5)'];
-            } else {
-                return isForeign 
-                    ? ['rgba(255, 80, 80, 0.8)', 'rgba(255, 255, 255, 1)']
-                    : ['rgba(130, 180, 255, 0.8)', 'rgba(255, 255, 255, 1)'];
-            }
-        })
-        .arcAltitudeAutoScale(0.3) 
-        .arcStroke(d => d.arcType === 'base' ? 0.3 : 0.9)            
-        .arcDashLength(d => d.arcType === 'base' ? 1 : 0.2)        
-        .arcDashGap(d => d.arcType === 'base' ? 0 : 0.8)           
-        .arcDashInitialGap(d => d.arcType === 'base' ? 0 : (d._randGap !== undefined ? d._randGap : Math.random()))
-        .arcDashAnimateTime(d => d.arcType === 'base' ? 0 : (d._randTime || 2500))
-        .arcsTransitionDuration(0); // 取消数据更新时的渐变过渡，防止新数据重置原有动画
-
-    world.pointOfView({ lat: TARGET_LOC.lat - 15, lng: TARGET_LOC.lng + 10, altitude: 2.2 });
-    world.controls().autoRotate = false;
-    world.controls().enableZoom = true;
-
-    // --- 窗口自适应大小 ---
-    window.addEventListener('resize', (event) => {
-        world.width(window.innerWidth);
-        world.height(window.innerHeight);
-    });
-
-    const logStream = document.getElementById('log-stream');
-    const allLogsStream = document.getElementById('all-logs-stream');
-    let attackPointsData = [], attackArcsData = [], attackRingsData = [];
-
-    function updateGlobeThreatData() {
-        const fullData = attackPointsData.concat([{ ...TARGET_LOC, isTarget: true }]);
-        // 发送给自定义精灵层而不是高耗能的 point 图层
-        world.customLayerData(fullData);
-        world.arcsData(attackArcsData);
-        world.ringsData(attackRingsData); 
-    }
-
-    // --- WebSocket 连接 ---
-    const wsIndicator = document.getElementById('ws-indicator');
-    const wsStatus = document.getElementById('ws-status');
-    wsIndicator.classList.add('connecting');
-
-    function setWsStatus(state) {
-        wsIndicator.className = 'live-indicator';
-        if (state === 'connected') {
-            wsStatus.innerText = '服务正常';
-        } else if (state === 'disconnected') {
-            wsIndicator.classList.add('disconnected');
-            wsStatus.innerText = '连接已断开';
-        } else {
-            wsIndicator.classList.add('connecting');
-            wsStatus.innerText = '服务连接中...';
-        }
-    }
-
-    const socket = io();
-
-    socket.on('connect', () => setWsStatus('connected'));
-    socket.on('disconnect', () => setWsStatus('disconnected'));
-    socket.on('connect_error', () => setWsStatus('disconnected'));
-
-    socket.on('init', (data) => {
-        allIpData = data;
-        updateFromData(data);
-        // 推送所有历史记录到全部日志和概览日志
-        data.forEach(loc => addLogEntry(loc));
-    });
-
-    socket.on('new_ip', (loc) => {
-        allIpData.push(loc);
-        updateFromData(allIpData);
-        if (document.getElementById('iplist-modal').classList.contains('active')) {
-            filterIpTable();
-        }
-        addLogEntry(loc);
-    });
-
-    socket.on('update_ip', (data) => {
-        let existing = allIpData.find(loc => loc.ip === data.ip && loc.module === data.module);
-        if (existing) {
-            existing.count = data.count;
-            existing.time = data.time;
-            updateFromData(allIpData);
-            // 如果面板打开了，触发刷新表格
-            if (document.getElementById('iplist-modal').classList.contains('active')) {
-                filterIpTable();
-            }
-            // 在侧边栏和日志流添加一条新连接记录
-            addLogEntry({...existing});
-        }
-    });
-
-    socket.on('sys_log', (data) => {
-        addSysLogEntry(data.msg, data.type);
-    });
-
-    socket.on('connection_opened', (data) => {
-        document.getElementById('active-count').innerText = data.active || 0;
-    });
-
-    socket.on('connection_closed', (data) => {
-        document.getElementById('active-count').innerText = data.active || 0;
-        addDisconnectLogEntry(data);
-    });
-
-    function updateFromData(data) {
-        // 过滤掉超过生命周期的条目（仅影响球面显示，allIpData 完整保留）
-        const activeData = data.filter(loc => !isExpired(loc)).slice(-60);
-
-        // 获取精确的排重IP数量 (按IP排重而不是IP+Module)
-        const uniqueIps = new Set(data.map(loc => loc.ip)).size;
-        const totalConns = data.reduce((sum, loc) => sum + (loc.count || 1), 0);
-        
-        document.getElementById('ip-count').innerText = uniqueIps;
-        document.getElementById('conn-count').innerText = totalConns;
-
-        attackPointsData = [];
-        attackArcsData = [];
-        
-        activeData.filter(loc => loc.lat && loc.lon).forEach(loc => {
-            // 核心修复：将线段对象缓存在原始数据 loc 上，保证对象引用恒定
-            // 如果不这么做，Globe.gl 每次检测到新对象就会销毁所有旧渲染并重新运行进场动画，导致全部闪烁
-            if (!loc._mappedData) {
-                loc._mappedData = {
-                    lat: loc.lat, lng: loc.lon, ip: loc.ip, desc: loc.desc, country: loc.country || ''
-                };
-                loc._baseArc = { ...loc._mappedData, arcType: 'base' };
-                // 固定一个随机初始缺口和时间，避免动画重置
-                loc._animArc = { ...loc._mappedData, arcType: 'anim', _randGap: Math.random() * 2, _randTime: 2500 + Math.random() * 1500 };
-            }
-            attackPointsData.push(loc._mappedData);
-            attackArcsData.push(loc._baseArc);
-            attackArcsData.push(loc._animArc);
-        });
-
-        attackRingsData = attackPointsData.slice(-10);
-        updateGlobeThreatData();
-    }
-
-    // 每分钟自动刷新球面，清除已过期的弧线
-    setInterval(() => updateFromData(allIpData), 60000);
-
-    function addLogEntry(loc) {
-        let entry = document.createElement('div');
-        entry.className = 'log-entry';
-        
-        // 尝试从 loc.time 解析时间，如果没有则用本地当前时间
-        let timeStr = '';
-        if (loc.time) {
-            const t = new Date(loc.time.replace(' ', 'T'));
-            timeStr = `${t.getHours().toString().padStart(2,'0')}:${t.getMinutes().toString().padStart(2,'0')}:${t.getSeconds().toString().padStart(2,'0')}`;
-        } else {
-            let now = new Date();
-            timeStr = `${now.getHours().toString().padStart(2,'0')}:${now.getMinutes().toString().padStart(2,'0')}:${now.getSeconds().toString().padStart(2,'0')}`;
-        }
-
-        const moduleBadge = loc.module ? `<span class="module-badge">${loc.module}</span>` : '';
-        const innerHTML = `
-            <div><span class="timestamp">[${timeStr}]</span> <strong>${loc.ip}</strong>${moduleBadge}</div>
-            <span class="geo">${loc.desc}</span>
-        `;
-        
-        entry.innerHTML = innerHTML;
-        logStream.insertBefore(entry, logStream.firstChild);
-        if (logStream.children.length > 5) logStream.removeChild(logStream.lastChild);
-
-        // 同时添加到“全部日志”中
-        let allEntry = document.createElement('div');
-        allEntry.className = 'log-entry';
-        allEntry.innerHTML = innerHTML;
-        allLogsStream.insertBefore(allEntry, allLogsStream.firstChild);
-        // 为了防止内存爆炸，全部日志最多保留最新的 1000 条
-        if (allLogsStream.children.length > 1000) allLogsStream.removeChild(allLogsStream.lastChild);
-    }
-
-    function addSysLogEntry(msg, type) {
-        let entry = document.createElement('div');
-        entry.className = 'log-entry';
-        
-        let color = type === 'unban' ? '#10b981' : '#ef4444';
-        let bgColor = type === 'unban' ? 'rgba(16, 185, 129, 0.15)' : 'rgba(239, 68, 68, 0.15)';
-        let title = type === 'unban' ? '系统操作' : '系统拦截';
-        
-        entry.style.background = bgColor;
-        entry.style.borderLeft = `3px solid ${color}`;
-        
-        let now = new Date();
-        let timeStr = `${now.getHours().toString().padStart(2,'0')}:${now.getMinutes().toString().padStart(2,'0')}:${now.getSeconds().toString().padStart(2,'0')}`;
-        
-        const innerHTML = `
-            <div><span class="timestamp" style="color: ${color}">[${timeStr}] ${title}</span></div>
-            <span class="geo" style="color: ${type === 'unban'? '#34d399' : '#f87171'}; font-weight: bold; margin-top: 4px; display: block;">${msg}</span>
-        `;
-        
-        entry.innerHTML = innerHTML;
-        logStream.insertBefore(entry, logStream.firstChild);
-        if (logStream.children.length > 5) logStream.removeChild(logStream.lastChild);
-
-        let allEntry = document.createElement('div');
-        allEntry.className = 'log-entry';
-        allEntry.style.background = bgColor;
-        allEntry.style.borderLeft = `3px solid ${color}`;
-        allEntry.innerHTML = innerHTML;
-        allLogsStream.insertBefore(allEntry, allLogsStream.firstChild);
-        if (allLogsStream.children.length > 1000) allLogsStream.removeChild(allLogsStream.lastChild);
-    }
-
-    function formatDuration(sec) {
-        if (sec === null || sec === undefined) return '';
-        if (sec < 1) return (sec * 1000).toFixed(0) + 'ms';
-        if (sec < 60) return sec.toFixed(1) + 's';
-        if (sec < 3600) return Math.floor(sec / 60) + 'm ' + Math.floor(sec % 60) + 's';
-        return Math.floor(sec / 3600) + 'h ' + Math.floor((sec % 3600) / 60) + 'm';
-    }
-
-    function addDisconnectLogEntry(data) {
-        let entry = document.createElement('div');
-        entry.className = 'log-entry';
-        entry.style.borderLeftColor = '#10b981';
-        let timeStr = '';
-        if (data.time) {
-            const t = new Date(data.time.replace(' ', 'T'));
-            timeStr = `${t.getHours().toString().padStart(2,'0')}:${t.getMinutes().toString().padStart(2,'0')}:${t.getSeconds().toString().padStart(2,'0')}`;
-        } else {
-            let now = new Date();
-            timeStr = `${now.getHours().toString().padStart(2,'0')}:${now.getMinutes().toString().padStart(2,'0')}:${now.getSeconds().toString().padStart(2,'0')}`;
-        }
-        const moduleBadge = data.module ? `<span class="module-badge" style="background:rgba(16,185,129,0.15);color:#10b981;border-color:rgba(16,185,129,0.3);">${data.module}</span>` : '';
-        const dur = formatDuration(data.duration);
-        const durationBadge = dur ? `<span class="module-badge" style="background:rgba(251,191,36,0.15);color:#fbbf24;border-color:rgba(251,191,36,0.3);">&#9201; ${dur}</span>` : '';
-        const innerHTML = `
-            <div><span class="timestamp" style="color:#10b981">[${timeStr}] 断开</span> <strong>${data.ip}</strong>${moduleBadge}${durationBadge}</div>
-            <span class="geo">${data.desc || ''}</span>
-        `;
-        entry.innerHTML = innerHTML;
-        logStream.insertBefore(entry, logStream.firstChild);
-        if (logStream.children.length > 5) logStream.removeChild(logStream.lastChild);
-        let allEntry = document.createElement('div');
-        allEntry.className = 'log-entry';
-        allEntry.style.borderLeftColor = '#10b981';
-        allEntry.innerHTML = innerHTML;
-        allLogsStream.insertBefore(allEntry, allLogsStream.firstChild);
-        if (allLogsStream.children.length > 1000) allLogsStream.removeChild(allLogsStream.lastChild);
-    }
-
-    // --- Foreign Highlight Toggle ---
-    function updateHighlightBtn() {
-        const btn = document.getElementById('highlight-btn');
-        if (foreignHighlight) {
-            btn.style.color = '#ef4444';
-            btn.style.borderColor = 'rgba(239,68,68,0.4)';
-        } else {
-            btn.style.color = '';
-            btn.style.borderColor = '';
-        }
-    }
-    function toggleForeignHighlight() {
-        foreignHighlight = !foreignHighlight;
-        updateHighlightBtn();
-        updateFromData(allIpData);
-    }
-    updateHighlightBtn();
-
-    // --- Panel Collapse ---
-    function togglePanel() {
-        document.getElementById('ui-panel').classList.toggle('collapsed');
-    }
-
-    // --- IP List Modal ---
-    let allIpData = [];
-    function openIpList(e) {
-        e.preventDefault();
-        document.getElementById('ip-search-input').value = '';
-        renderIpTable(allIpData);
-        loadFirewallRules(); // 加载黑名单
-        document.getElementById('iplist-modal').classList.add('active');
-    }
-    function closeIpList() {
-        document.getElementById('iplist-modal').classList.remove('active');
-    }
-    function switchTab(tabId) {
-        document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
-        document.querySelectorAll('.tab-content').forEach(tab => tab.classList.remove('active'));
-        document.querySelector(`.tab-btn[onclick*="${tabId}"]`).classList.add('active');
-        document.getElementById(tabId).classList.add('active');
-        if (tabId === 'tab-firewall') {
-            loadFirewallRules();
-        }
-    }
-    
-    function blockIp(ip) {
-        customDialog.confirm(`确定要将 ${ip} 加入防火墙黑名单吗？该 IP 将被彻底阻断。`, () => {
-            fetch('/api/firewall/add', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ ip: ip })
-            }).then(r => r.json()).then(data => {
-                if (data.status === 'success') {
-                    customDialog.alert(data.msg, () => loadFirewallRules());
-                } else {
-                    customDialog.alert('阻断失败: ' + data.msg);
-                }
-            });
-        });
-    }
-
-    function unblockIp(ip) {
-        customDialog.confirm(`确定要解除对 ${ip} 的阻断吗？`, () => {
-            fetch('/api/firewall/remove', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ ip: ip })
-            }).then(r => r.json()).then(data => {
-                if (data.status === 'success') {
-                    customDialog.alert(data.msg, () => loadFirewallRules());
-                } else {
-                    customDialog.alert('解封失败: ' + data.msg);
-                }
-            });
-        });
-    }
-
-    function loadFirewallRules() {
-        fetch('/api/firewall').then(r => r.json()).then(res => {
-            if (res.status === 'success') {
-                const tbody = document.getElementById('firewall-table-body');
-                const data = res.data;
-                document.getElementById('fw-count').innerText = `(${data.length})`;
-                if (data.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#666;padding:20px;">暂无黑名单规则</td></tr>';
-                    return;
-                }
-                tbody.innerHTML = data.map(rule => `
-                    <tr>
-                        <td>${rule.num}</td>
-                        <td><span class="t-ip" style="color:#ef4444">${rule.ip}</span></td>
-                        <td><span class="t-module" style="background:rgba(239,68,68,0.1);color:#ef4444">${rule.target}</span></td>
-                        <td style="text-align:center"><button class="btn-unblock" onclick="unblockIp('${rule.ip}')">解封</button></td>
-                    </tr>
-                `).join('');
-            }
-        }).catch(err => {
-            console.error("加载防火墙规则失败", err);
-        });
-    }
-
-    document.getElementById('iplist-modal').addEventListener('click', function(e) {
-        if (e.target === this) closeIpList();
-    });
-    function renderIpTable(data) {
-        const tbody = document.getElementById('ip-table-body');
-        // reversed so newest at top
-        const reversed = [...data].reverse();
-        tbody.innerHTML = reversed.map((loc, i) => `
-            <tr title="${loc.ip}" style="${(loc.count || 1) >= FREQUENT_THRESHOLD ? 'background:rgba(239,68,68,0.15);' : ''}">
-                <td style="color:#555;font-size:12px">${data.length - i}</td>
-                <td><span class="t-ip" style="${(loc.count || 1) >= FREQUENT_THRESHOLD ? 'color:#fca5a5;' : ''}">${loc.ip}</span></td>
-                <td title="${loc.desc||''}">${loc.desc || '—'}</td>
-                <td>${loc.module ? `<span class="t-module" title="${loc.module}">${loc.module}</span>` : '<span style="color:#444">—</span>'}</td>
-                <td style="text-align:center; font-weight:bold; color: ${(loc.count || 1) >= FREQUENT_THRESHOLD ? '#ef4444' : '#10b981'};">${loc.count || 1}</td>
-                <td style="color:#64748b;font-size:12px;font-family:ui-monospace,monospace">${loc.time || '—'}</td>
-                <td style="text-align:center"><button class="btn-block" onclick="blockIp('${loc.ip}')">封禁</button></td>
-            </tr>
-        `).join('');
-        document.getElementById('ip-count-info').innerText = `共 ${data.length} 条记录`;
-    }
-    function filterIpTable() {
-        const q = document.getElementById('ip-search-input').value.toLowerCase();
-        const freqOnly = document.getElementById('frequent-filter').checked;
-        
-        let filtered = allIpData;
-        if (freqOnly) {
-            filtered = filtered.filter(loc => (loc.count || 1) >= FREQUENT_THRESHOLD);
-        }
-        if (q) {
-            filtered = filtered.filter(loc =>
-                (loc.ip||'').toLowerCase().includes(q) ||
-                (loc.desc||'').toLowerCase().includes(q) ||
-                (loc.module||'').toLowerCase().includes(q)
-            );
-        }
-        renderIpTable(filtered);
-        document.getElementById('ip-count-info').innerText = `共 ${filtered.length} / ${allIpData.length} 条记录`;
-    }
-
-    // --- All Logs Modal ---
-    function openAllLogs(e) {
-        e.preventDefault();
-        document.getElementById('all-logs-modal').classList.add('active');
-    }
-    function closeAllLogs() {
-        document.getElementById('all-logs-modal').classList.remove('active');
-    }
-    document.getElementById('all-logs-modal').addEventListener('click', function(e) {
-        if (e.target === this) closeAllLogs();
-    });
-
-    function openSettings(e) {
-        e.preventDefault();
-        document.getElementById('modal-msg').innerText = '加载配置中...';
-        document.getElementById('modal-msg').style.color = '#888';
-        
-        // 密码修改区默认收起并清空
-        document.getElementById('cfg_change_pwd').checked = false;
-        document.getElementById('pwd_section').style.display = 'none';
-        document.getElementById('m_old_pwd').value = '';
-        document.getElementById('m_new_pwd').value = '';
-        document.getElementById('m_confirm_pwd').value = '';
-        
-        document.getElementById('settings-modal').classList.add('active');
-        
-        fetch('/api/settings')
-            .then(r => r.json())
-            .then(res => {
-                if (res.status === 'success') {
-                    document.getElementById('modal-msg').innerText = '';
-                    const cfg = res.data;
-                    document.getElementById('cfg_log_file').value = cfg.frp_log_file || '';
-                    document.getElementById('cfg_home_country').value = cfg.home_country || '';
-                    document.getElementById('cfg_frequent_threshold').value = cfg.frequent_threshold || 5;
-                    document.getElementById('cfg_foreign_highlight').checked = !!cfg.foreign_highlight;
-                    document.getElementById('cfg_admin_user').value = cfg.admin_username || '';
-                    
-                    const ab = cfg.auto_ban || {};
-                    document.getElementById('cfg_ban_enabled').checked = !!ab.enabled;
-                    document.getElementById('cfg_ban_foreign_only').checked = ab.foreign_only !== false; // default true
-                    document.getElementById('cfg_ban_seconds').value = ab.threshold_seconds || 60;
-                    document.getElementById('cfg_ban_count').value = ab.threshold_count || 10;
-                    document.getElementById('cfg_ban_modules').value = (ab.whitelist_modules || []).join('\n');
-                    document.getElementById('cfg_ban_ips').value = (ab.whitelist_ips || []).join('\n');
-                } else {
-                    document.getElementById('modal-msg').innerText = '配置加载失败';
-                    document.getElementById('modal-msg').style.color = '#ef4444';
-                }
-            });
-    }
-    
-    function closeSettings() {
-        document.getElementById('settings-modal').classList.remove('active');
-    }
-    document.getElementById('settings-modal').addEventListener('click', function(e) {
-        if (e.target === this) closeSettings();
-    });
-    
-    function saveSettings() {
-        const msgEl = document.getElementById('modal-msg');
-        
-        // 校验两次密码输入
-        const changePwd = document.getElementById('cfg_change_pwd').checked;
-        const pwd1 = document.getElementById('m_new_pwd').value;
-        const pwd2 = document.getElementById('m_confirm_pwd').value;
-        if (changePwd && pwd1 !== pwd2) {
-            msgEl.innerText = '两次输入的新密码不一致';
-            msgEl.style.color = '#ef4444';
-            return;
-        }
-
-        msgEl.innerText = '正在保存并应用修改...';
-        msgEl.style.color = '#888';
-        
-        const payload = {
-            frp_log_file: document.getElementById('cfg_log_file').value.trim(),
-            home_country: document.getElementById('cfg_home_country').value.trim(),
-            frequent_threshold: parseInt(document.getElementById('cfg_frequent_threshold').value) || 5,
-            foreign_highlight: document.getElementById('cfg_foreign_highlight').checked,
-            admin_username: document.getElementById('cfg_admin_user').value.trim() || 'root',
-            auto_ban: {
-                enabled: document.getElementById('cfg_ban_enabled').checked,
-                foreign_only: document.getElementById('cfg_ban_foreign_only').checked,
-                threshold_seconds: parseInt(document.getElementById('cfg_ban_seconds').value) || 60,
-                threshold_count: parseInt(document.getElementById('cfg_ban_count').value) || 10,
-                whitelist_modules: document.getElementById('cfg_ban_modules').value.split('\n').map(s=>s.trim()).filter(Boolean),
-                whitelist_ips: document.getElementById('cfg_ban_ips').value.split('\n').map(s=>s.trim()).filter(Boolean)
-            },
-            change_pwd: changePwd,
-            old_password: document.getElementById('m_old_pwd').value,
-            new_password: pwd1
-        };
-
-        fetch('/api/settings', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify(payload)
-        }).then(r => r.json()).then(data => {
-            if (data.status === 'success') {
-                msgEl.style.color = '#10b981';
-                msgEl.innerText = data.msg;
-                // 更新高亮等前端变量
-                foreignHighlight = payload.foreign_highlight;
-                updateHighlightBtn();
-                setTimeout(closeSettings, 1500);
-            } else {
-                msgEl.style.color = '#ef4444';
-                msgEl.innerText = data.msg;
-            }
-        }).catch(() => {
-            msgEl.style.color = '#ef4444';
-            msgEl.innerText = '网络请求失败，请重试';
-        });
-    }
 </script>
+<!-- 主脚本 -->
+<script src="{{ url_for('static', filename='js/app.js') }}"></script>
 
 </body>
 </html>

@@ -7,427 +7,654 @@
 # ]
 # ///
 
+"""
+FRP_PV — frp Server Plugin 态势感知与主动防御系统
+
+工作流程:
+  用户连接 → frps → HTTP POST /frp-plugin → 内存判定 → reject / allow
+  延迟 <5 ms · 精度 100% · 无需 iptables
+"""
+
+from __future__ import annotations
+
+import json
 import os
 import re
 import time
-import json
-import datetime
-import requests
-from flask import Flask, render_template, jsonify, request, session, redirect, url_for
-from flask_socketio import SocketIO, emit
+from collections import defaultdict
+from dataclasses import asdict, dataclass
 from functools import wraps
-from collections import defaultdict, deque
+from pathlib import Path
+from threading import Lock, Thread
+from typing import Optional
+
+import requests as http_requests
+from flask import (
+    Flask,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
+from flask_socketio import SocketIO, emit
 from werkzeug.security import check_password_hash, generate_password_hash
-from threading import Thread
-import subprocess
-
-# 载入配置
-CONFIG_FILE = os.path.join(os.path.dirname(__file__), 'config.json')
-with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-    config = json.load(f)
-
-app = Flask(__name__)
-# 载入Session密钥
-app.secret_key = config.get("secret_key", os.urandom(24).hex())
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
-
-# 定义日志文件路径
-_cached_config = None
-_last_config_load_time = 0
-
-def get_log_file():
-    global _cached_config, _last_config_load_time
-    now = time.time()
-    # 限制配置读取频率，每 5 秒最多重新加载一次，避免高发日志时频繁读写文件
-    if now - _last_config_load_time > 5:
-        try:
-            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                _cached_config = json.load(f)
-                _last_config_load_time = now
-        except:
-            if _cached_config is None:
-                _cached_config = config
-    
-    current_config = _cached_config if _cached_config else config
-    return os.getenv("FRP_LOG_FILE") or current_config.get("frp_log_file", "/root/frp/frp_run.log")
 
 
+# ═══════════════════════════════════════════════════════════
+#  数据模型
+# ═══════════════════════════════════════════════════════════
 
-ip_cache = {}    # 缓存已解析的 IP -> 地理信息映射
-ip_connections = defaultdict(list) # 记录 IP 的访问时间戳，用于自动封禁
-locations = []   # 保存用于前端展示的位置列表
-location_map = {} # 记录 (ip, module) -> dict 进行引用更新
-active_conns = defaultdict(deque) # module -> deque of {ip, connect_time}，追踪活跃连接
 
-def get_geo_info(ip):
-    """仅获取IP地理位置信息，带缓存防限流"""
-    if ip in ip_cache:
-        return ip_cache[ip]
-    try:
-        # 排除了一些局域网 IP
-        if ip.startswith("127.") or ip.startswith("192.168.") or ip.startswith("10.") or ip.startswith("172."):
-            ip_cache[ip] = None
+@dataclass
+class GeoInfo:
+    """IP 地理位置快照"""
+
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+    country: str = ""
+    desc: str = ""
+
+
+@dataclass
+class ConnectionRecord:
+    """单条访问聚合记录 (ip + module 唯一)"""
+
+    ip: str
+    module: str
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+    country: str = ""
+    desc: str = ""
+    time: str = ""
+    count: int = 1
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+# ═══════════════════════════════════════════════════════════
+#  配置管理器
+# ═══════════════════════════════════════════════════════════
+
+
+class ConfigManager:
+    """统一读写 config.json, 线程安全"""
+
+    def __init__(self, path: str | Path) -> None:
+        self._path = Path(path)
+        self._lock = Lock()
+        self._data: dict = {}
+        self.reload()
+
+    # -- 读写 --
+
+    def reload(self) -> None:
+        with open(self._path, "r", encoding="utf-8") as f:
+            self._data = json.load(f)
+
+    def save(self) -> None:
+        with self._lock:
+            with open(self._path, "w", encoding="utf-8") as f:
+                json.dump(self._data, f, indent=2, ensure_ascii=False)
+
+    # -- 字段操作 --
+
+    def get(self, key: str, default=None):
+        return self._data.get(key, default)
+
+    def set(self, key: str, value) -> None:
+        self._data[key] = value
+
+    @property
+    def raw(self) -> dict:
+        """直接暴露底层 dict (供 Jinja 模板访问)"""
+        return self._data
+
+
+# ═══════════════════════════════════════════════════════════
+#  地理位置服务
+# ═══════════════════════════════════════════════════════════
+
+_PRIVATE_PREFIXES = ("127.", "192.168.", "10.", "172.")
+
+
+class GeoService:
+    """IP 地理信息查询 — ipwho.is 免费接口 + 内存缓存"""
+
+    API_URL = "http://ipwho.is/{ip}?lang=zh-CN"
+    TIMEOUT = 5
+
+    def __init__(self) -> None:
+        self._cache: dict[str, Optional[GeoInfo]] = {}
+
+    def lookup(self, ip: str) -> Optional[GeoInfo]:
+        """查询并缓存; 内网 IP 直接返回 None"""
+        if ip in self._cache:
+            return self._cache[ip]
+
+        if ip.startswith(_PRIVATE_PREFIXES):
+            self._cache[ip] = None
             return None
-            
-        # 因 ip-api.com 在国内可能被墙，这里改用 ipwho.is 免费接口 + 设置超时防卡死
-        res = requests.get(f"http://ipwho.is/{ip}?lang=zh-CN", timeout=5).json()
-        if res.get('success') is True:
-            geo_data = {
-                "lat": res.get("latitude"),
-                "lon": res.get("longitude"),
-                "country": res.get("country", ""),
-                "desc": f"{res.get('country', '')} - {res.get('city', '')}".strip(" - ")
-            }
-            ip_cache[ip] = geo_data
-            return geo_data
-    except Exception as e:
-        print(f"Error fetching IP {ip}: {e}")
-    ip_cache[ip] = None
-    return None
 
-def parse_log_timestamp(line):
-    """从 frps 日志行中提取精确时间戳"""
-    m = re.match(r'(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}\.\d{3})', line)
-    if m:
-        return datetime.datetime.strptime(m.group(1), '%Y-%m-%d %H:%M:%S.%f')
-    return None
-
-def watch_log():
-    """后台监控并解析 frp 日志文件"""
-    while True:
         try:
-            current_log_file = get_log_file()
-            if not current_log_file or not os.path.exists(current_log_file):
-                print(f"警告: 日志文件 {current_log_file} 不存在，等待其生成...")
-                while not current_log_file or not os.path.exists(current_log_file):
-                    current_log_file = get_log_file()
-                    time.sleep(5)
-                    
-            print(f"开始监控日志: {current_log_file}")
-            try:
-                with open(current_log_file, 'r', encoding='utf-8') as f:
-                    # 查找最后一次 frps 启动位置，从该处加载历史连接数据
-                    last_start_pos = f.tell()
-                    while True:
-                        line = f.readline()
-                        if not line:
-                            break
-                        if 'frps uses config file:' in line:
-                            last_start_pos = f.tell()
-                    f.seek(last_start_pos)
-                    print(f"从最近一次 frps 启动记录开始初始化历史数据...")
-                    is_init = True
-                    # 记录inode信息，检查是否被轮换或修改路径
-                    current_ino = os.fstat(f.fileno()).st_ino
-                    
-                    while True:
-                        new_log_file = get_log_file()
-                        if new_log_file != current_log_file:
-                            print(f"检测到日志文件配置变更: {current_log_file} -> {new_log_file}")
-                            break
-                            
-                        line = f.readline()
-                        if not line:
-                            if is_init:
-                                is_init = False
-                                active = sum(len(q) for q in active_conns.values())
-                                print(f"历史数据初始化完成: {len(locations)} 条 IP 记录, 活跃连接 {active}")
-                            time.sleep(1)
-                            
-                            # 检查文件是否被重建或轮转
-                            try:
-                                if os.stat(current_log_file).st_ino != current_ino:
-                                    print(f"检测到日志文件 {current_log_file} 已轮存更新")
-                                    break
-                            except FileNotFoundError:
-                                print(f"日志文件 {current_log_file} 被移除")
-                                break
-                                
-                            continue
-                            
-                        # 正则匹配 frp 日志中的模块名和客户端 IP
-                        # 新格式: 2026-03-08 16:40:26.417 [I] [proxy/proxy.go:204] [4b30cb9a69ac7f18] [keai_server_web_https] get a user connection [106.87.123.185:3368]
-                        match = re.search(r'(?:\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}\.\d{3}\s+\[.*?\]\s+\[.*?\]\s+\[.*?\]\s+)?\[([^\]]+)\] get a user connection \[([^\]]+):\d+\]', line)
-                        if match:
-                            module = match.group(1)
-                            ip = match.group(2)
-                            
-                            # 1. 获取归属地并记录模块访问次数
-                            if ip not in ip_cache:
-                                print(f"检测到新 IP: {ip} (模块: {module}), 正在查询地理位置...")
-                                get_geo_info(ip)
-                                time.sleep(0.3 if is_init else 1.5)
-                            
-                            geo_data = ip_cache.get(ip)
-                            
-                            key = (ip, module)
-                            if key not in location_map:
-                                data = {
-                                    "ip": ip,
-                                    "lat": geo_data.get("lat") if geo_data else None,
-                                    "lon": geo_data.get("lon") if geo_data else None,
-                                    "country": geo_data.get("country", "") if geo_data else "",
-                                    "desc": geo_data.get("desc", "") if geo_data else "",
-                                    "module": module,
-                                    "time": time.strftime('%Y-%m-%d %H:%M:%S'),
-                                    "count": 1
-                                }
-                                location_map[key] = data
-                                locations.append(data)
-                                socketio.emit('new_ip', data)
-                            else:
-                                data = location_map[key]
-                                data["count"] = data.get("count", 1) + 1
-                                data["time"] = time.strftime('%Y-%m-%d %H:%M:%S')
-                                socketio.emit('update_ip', data)
-                                
-                            # 2. 自动封禁 (Auto Ban) 判定逻辑
-                            cfg = _cached_config if _cached_config else config
-                            auto_ban = cfg.get("auto_ban", {})
-                            
-                            whitelist_ips = auto_ban.get("whitelist_ips", [])
-                            
-                            if auto_ban.get("enabled", False) and module not in auto_ban.get("whitelist_modules", []) and ip not in whitelist_ips:
-                                country = geo_data.get('country', '') if geo_data else ''
-                                home = cfg.get("home_country", "中国")
-                                
-                                # 根据条件判断该 IP 是否受规则管控
-                                # 默认开启 foreign_only，即若检测到是 home_country (如中国) 的 IP，直接放行不记录累加
-                                if not (auto_ban.get("foreign_only", True) and country == home):
-                                    now = time.time()
-                                    history = ip_connections[ip]
-                                    history.append(now)
-                                    
-                                    limit_sec = auto_ban.get("threshold_seconds", 60)
-                                    limit_count = auto_ban.get("threshold_count", 10)
-                                    
-                                    # 剔除滑动窗口外（超时）的历史记录
-                                    while history and now - history[0] > limit_sec:
-                                        history.pop(0)
-                                        
-                                    if len(history) >= limit_count:
-                                        print(f"⚠️ [系统预警] 触发自动封禁: {ip} 在 {limit_sec} 秒内不断连接非白名单模块 {module} 达 {len(history)} 次")
-                                        try:
-                                            # 防重复写入
-                                            subprocess.check_call(['iptables', '-D', 'INPUT', '-s', ip, '-j', 'DROP'], stderr=subprocess.DEVNULL)
-                                        except: pass
-                                        try:
-                                            subprocess.check_call(['iptables', '-A', 'INPUT', '-s', ip, '-j', 'DROP'])
-                                            print(f"🛡️ 已将 {ip} 自动加入系统 iptables 黑名单阻断")
-                                            socketio.emit('sys_log', {'msg': f"自动封禁: {ip} (频繁连接 {module})"})
-                                        except Exception as e:
-                                            print(f"执行防火墙封禁失败: {e}")
-                                            
-                                        # 清空记录避免该IP紧接着无意义的连续触发拉黑命令
-                                        history.clear()
-
-                        # 3. 连接建立追踪
-                        join_match = re.search(
-                            r'\[([^\]]+)\] join connections, workConn\(.*?\) userConn\(.*?r\[([^\]]+):\d+\]\)',
-                            line
+            resp = http_requests.get(
+                self.API_URL.format(ip=ip), timeout=self.TIMEOUT
+            ).json()
+            if resp.get("success") is True:
+                geo = GeoInfo(
+                    lat=resp.get("latitude"),
+                    lon=resp.get("longitude"),
+                    country=resp.get("country", ""),
+                    desc=(
+                        f"{resp.get('country', '')} - {resp.get('city', '')}".strip(
+                            " - "
                         )
-                        if join_match:
-                            j_module = join_match.group(1)
-                            j_ip = join_match.group(2)
-                            j_ts = parse_log_timestamp(line)
-                            active_conns[j_module].append({'ip': j_ip, 'connect_time': j_ts})
-                            socketio.emit('connection_opened', {
-                                'module': j_module, 'ip': j_ip,
-                                'active': sum(len(q) for q in active_conns.values())
-                            })
+                    ),
+                )
+                self._cache[ip] = geo
+                return geo
+        except Exception as e:
+            print(f"[GEO] 查询失败 {ip}: {e}")
 
-                        # 4. 连接断开追踪 (计算持续时长)
-                        close_match = re.search(r'\[([^\]]+)\] join connections closed', line)
-                        if close_match:
-                            c_module = close_match.group(1)
-                            duration = None
-                            c_ip = None
-                            if active_conns[c_module]:
-                                conn = active_conns[c_module].popleft()
-                                c_ip = conn['ip']
-                                c_ts = parse_log_timestamp(line)
-                                if c_ts and conn.get('connect_time'):
-                                    duration = (c_ts - conn['connect_time']).total_seconds()
-                            geo = ip_cache.get(c_ip) if c_ip else None
-                            socketio.emit('connection_closed', {
-                                'ip': c_ip or '未知',
-                                'module': c_module,
-                                'duration': round(duration, 3) if duration is not None else None,
-                                'time': time.strftime('%Y-%m-%d %H:%M:%S'),
-                                'desc': geo.get('desc', '') if geo else '',
-                                'country': geo.get('country', '') if geo else '',
-                                'active': sum(len(q) for q in active_conns.values())
-                            })
+        self._cache[ip] = None
+        return None
 
-            except Exception as e:
-                print(f"读取日志文件遇到错误: {e}")
-                time.sleep(5)
-        except Exception as outer_e:
-            print(f"监控线程出现意外错误: {outer_e}")
-            time.sleep(5)
+    def get_cached(self, ip: str) -> Optional[GeoInfo]:
+        """仅读缓存, 不触发网络请求"""
+        return self._cache.get(ip)
 
-def login_required(f):
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        if not session.get('logged_in'):
-            return redirect(url_for('login', next=request.url))
-        return f(*args, **kwargs)
-    return decorated_function
 
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    error = None
-    if request.method == 'POST':
-        username = request.form.get('username')
-        password = request.form.get('password', '')
-        
-        cfg_user = config.get('admin_username', 'root')
-        cfg_hash = config.get('admin_password_hash', '')
-        
-        if username == cfg_user:
-            # 如果配置的密码为空（即无密码状态）或密码匹配成功
-            if (not cfg_hash and password == '') or (cfg_hash and check_password_hash(cfg_hash, password)):
-                session['logged_in'] = True
-                return redirect(url_for('index'))
-            else:
-                error = '密码错误。当前默认无密码时请直接留空。' if not cfg_hash else '用户名或密码错误'
+# ═══════════════════════════════════════════════════════════
+#  封禁管理器
+# ═══════════════════════════════════════════════════════════
+
+
+class BanManager:
+    """IP 封禁列表 + 滑动窗口自动封禁"""
+
+    MAX_BLOCKED_LOG = 200
+
+    def __init__(self, cfg: ConfigManager) -> None:
+        self._cfg = cfg
+        self._lock = Lock()
+        self._banned: set[str] = set(cfg.get("banned_ips", []))
+        self._windows: dict[str, list[float]] = defaultdict(list)
+        self.blocked_count: int = 0
+        self._blocked_log: list[dict] = []
+
+    # -- 查询 --
+
+    @property
+    def banned_set(self) -> set[str]:
+        return self._banned
+
+    def is_banned(self, ip: str) -> bool:
+        return ip in self._banned
+
+    def sorted_list(self) -> list[str]:
+        return sorted(self._banned)
+
+    # -- 操作 --
+
+    def ban(self, ip: str) -> None:
+        with self._lock:
+            self._banned.add(ip)
+            self._persist()
+
+    def unban(self, ip: str) -> None:
+        with self._lock:
+            self._banned.discard(ip)
+            self._persist()
+
+    def increment_blocked(self) -> int:
+        self.blocked_count += 1
+        return self.blocked_count
+
+    def log_blocked(self, ip: str, proxy: str, reason: str,
+                    desc: str = "", country: str = "") -> dict:
+        """记录一次拦截事件并返回该记录"""
+        rec = {
+            "ip": ip,
+            "proxy": proxy,
+            "reason": reason,
+            "desc": desc,
+            "country": country,
+            "time": int(time.time()),
+        }
+        with self._lock:
+            self._blocked_log.append(rec)
+            if len(self._blocked_log) > self.MAX_BLOCKED_LOG:
+                self._blocked_log = self._blocked_log[-self.MAX_BLOCKED_LOG:]
+        return rec
+
+    @property
+    def blocked_list(self) -> list[dict]:
+        """返回拦截日志副本 (最新在后)"""
+        with self._lock:
+            return list(self._blocked_log)
+
+    # -- 自动封禁 --
+
+    def check_auto_ban(self, ip: str, proxy: str, country: str) -> bool:
+        """滑动窗口频率检测; 返回 True = 已触发封禁"""
+        ab = self._cfg.get("auto_ban", {})
+        if not ab.get("enabled", False):
+            return False
+        if proxy in ab.get("whitelist_modules", []):
+            return False
+        if ip in ab.get("whitelist_ips", []):
+            return False
+
+        home = self._cfg.get("home_country", "中国")
+        if ab.get("foreign_only", True) and country == home:
+            return False
+
+        now = time.time()
+        window = self._windows[ip]
+        window.append(now)
+
+        limit_sec = ab.get("threshold_seconds", 60)
+        limit_count = ab.get("threshold_count", 10)
+
+        while window and now - window[0] > limit_sec:
+            window.pop(0)
+
+        if len(window) >= limit_count:
+            hit = len(window)
+            window.clear()
+            self.ban(ip)
+            self.blocked_count += 1
+            print(
+                f"⚠️ 自动封禁: {ip} ({limit_sec}s 内连接 {proxy} 达 {hit} 次)"
+            )
+            return True
+
+        return False
+
+    # -- 内部 --
+
+    def _persist(self) -> None:
+        self._cfg.set("banned_ips", sorted(self._banned))
+        self._cfg.save()
+
+
+# ═══════════════════════════════════════════════════════════
+#  连接追踪器
+# ═══════════════════════════════════════════════════════════
+
+
+class ConnectionTracker:
+    """聚合所有用户连接, 按 (ip, module) 去重累加; 按 remote_addr 精确追踪活跃连接"""
+
+    def __init__(self, geo: GeoService, sio: SocketIO) -> None:
+        self._geo = geo
+        self._sio = sio
+        self._records: list[dict] = []
+        self._index: dict[tuple[str, str], dict] = {}
+        # 活跃连接: remote_addr (ip:port) → {ip, proxy, time}
+        self._active: dict[str, dict] = {}
+
+    @property
+    def all_records(self) -> list[dict]:
+        return self._records
+
+    @property
+    def active_count(self) -> int:
+        return len(self._active)
+
+    def record(self, ip: str, module: str, remote_addr: str) -> None:
+        """地理查询 → 内存聚合 → WebSocket 推送 (在后台线程调用)"""
+        geo = self._geo.lookup(ip)
+        key = (ip, module)
+
+        if key not in self._index:
+            rec = ConnectionRecord(
+                ip=ip,
+                module=module,
+                lat=geo.lat if geo else None,
+                lon=geo.lon if geo else None,
+                country=geo.country if geo else "",
+                desc=geo.desc if geo else "",
+                time=time.strftime("%Y-%m-%d %H:%M:%S"),
+            ).to_dict()
+            self._index[key] = rec
+            self._records.append(rec)
+            self._sio.emit("new_ip", rec)
         else:
-            error = '用户名或密码错误'
-            
-    return render_template('login.html', error=error)
+            rec = self._index[key]
+            rec["count"] = rec.get("count", 1) + 1
+            rec["time"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            self._sio.emit("update_ip", rec)
 
-@app.route('/logout')
-def logout():
-    session.pop('logged_in', None)
-    return redirect(url_for('login'))
+        # geo 已缓存, 此时推送 connection_opened (带完整地理信息)
+        if remote_addr in self._active:
+            self._sio.emit("connection_opened", {
+                "ip": ip, "module": module, "active": self.active_count,
+                "remote_addr": remote_addr,
+                "desc": geo.desc if geo else "",
+                "country": geo.country if geo else "",
+            })
 
-@app.route('/api/settings', methods=['GET', 'POST'])
-@login_required
-def api_settings():
-    if request.method == 'GET':
-        return jsonify({
-            "status": "success",
-            "data": {
-                "frp_log_file": config.get("frp_log_file", "/root/frp/frp_run.log"),
-                "home_country": config.get("home_country", "中国"),
-                "frequent_threshold": config.get("frequent_threshold", 5),
-                "foreign_highlight": config.get("foreign_highlight", True),
-                "admin_username": config.get("admin_username", "root"),
-                "auto_ban": config.get("auto_ban", {})
-            }
+    @property
+    def active_list(self) -> list[dict]:
+        """当前所有活跃连接的快照 (供前端初始化)"""
+        now = time.time()
+        result = []
+        for addr, info in self._active.items():
+            geo = self._geo.get_cached(info["ip"])
+            result.append({
+                "ip": info["ip"],
+                "module": info["proxy"],
+                "remote_addr": addr,
+                "since": round(info["time"]),
+                "elapsed": round(now - info["time"], 1),
+                "desc": geo.desc if geo else "",
+                "country": geo.country if geo else "",
+            })
+        return result
+
+    def open_connection(self, ip: str, proxy: str, remote_addr: str) -> None:
+        """标记一个活跃连接 (仅记录, 不 emit)"""
+        self._active[remote_addr] = {"ip": ip, "proxy": proxy, "time": time.time()}
+
+    def close_connection(self, ip: str, proxy: str, remote_addr: str) -> None:
+        """关闭一个活跃连接 (CloseUserConn 时调用)"""
+        info = self._active.pop(remote_addr, None)
+        connect_time = info["time"] if info else None
+        duration = round(time.time() - connect_time, 3) if connect_time else None
+        geo = self._geo.get_cached(ip)
+        self._sio.emit("connection_closed", {
+            "ip": ip,
+            "module": proxy,
+            "remote_addr": remote_addr,
+            "duration": duration,
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "desc": geo.desc if geo else "",
+            "country": geo.country if geo else "",
+            "active": self.active_count,
         })
 
-    if not request.is_json:
-        return jsonify({"status": "error", "msg": "请求格式错误"}), 400
-        
-    data = request.get_json()
-    
-    # 账号与密码处理
-    if data.get('change_pwd'):
-        old_password = data.get('old_password', '')
-        new_password = data.get('new_password', '')
-        cfg_hash = config.get('admin_password_hash', '')
-        
-        if cfg_hash and not check_password_hash(cfg_hash, old_password):
-            return jsonify({"status": "error", "msg": "原密码错误"})
-        elif not cfg_hash and old_password != '':
-            return jsonify({"status": "error", "msg": "原密码为空，请留空"})
-            
-        config['admin_password_hash'] = generate_password_hash(new_password) if new_password else ''
 
-    # 常规配置处理
-    config['frp_log_file'] = data.get('frp_log_file', config.get('frp_log_file'))
-    config['home_country'] = data.get('home_country', config.get('home_country'))
-    config['frequent_threshold'] = data.get('frequent_threshold', config.get('frequent_threshold'))
-    if 'auto_ban' in data:
-        config['auto_ban'] = data['auto_ban']
-        
-    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-        json.dump(config, f, indent=2, ensure_ascii=False)
-        
-    # 主动刷新内存中的缓存配置
-    global _cached_config
-    _cached_config = config
-    
-    return jsonify({"status": "success", "msg": "系统设置保存成功！"})
+# ═══════════════════════════════════════════════════════════
+#  工具函数
+# ═══════════════════════════════════════════════════════════
 
-@app.route('/')
-@login_required
-def index():
-    return render_template('index.html', config=config)
-
-@app.route('/api/data')
-@login_required
-def api_data():
-    return jsonify(locations)
-
-@app.route('/api/firewall', methods=['GET'])
-@login_required
-def get_firewall():
-    try:
-        result = subprocess.check_output(['iptables', '-nL', 'INPUT', '--line-numbers'], universal_newlines=True)
-        blocked_ips = []
-        for line in result.split('\n'):
-            parts = line.split()
-            # 根据 iptables -nL INPUT --line-numbers 格式解析
-            # 例: 1    DROP       all  --  1.2.3.4              0.0.0.0/0
-            if len(parts) >= 5 and parts[1] == 'DROP' and parts[4] != '0.0.0.0/0':
-                blocked_ips.append({
-                    "num": parts[0],
-                    "ip": parts[4],
-                    "target": parts[1]
-                })
-        return jsonify({"status": "success", "data": blocked_ips})
-    except Exception as e:
-        return jsonify({"status": "error", "msg": str(e)}), 500
-
-@app.route('/api/firewall/add', methods=['POST'])
-@login_required
-def add_firewall():
-    data = request.get_json()
-    ip = data.get('ip')
-    if not ip or not re.match(r'^\d{1,3}(\.\d{1,3}){3}$', ip):
-        return jsonify({"status": "error", "msg": "无效的 IP 地址"})
-    try:
-        # 添加防火墙规则
-        subprocess.check_call(['iptables', '-A', 'INPUT', '-s', ip, '-j', 'DROP'])
-        socketio.emit('sys_log', {'msg': f"手动封禁: 已将 {ip} 加入黑名单"})
-        return jsonify({"status": "success", "msg": f"已将 {ip} 加入黑名单并阻断访问"})
-    except Exception as e:
-        return jsonify({"status": "error", "msg": str(e)}), 500
-
-@app.route('/api/firewall/remove', methods=['POST'])
-@login_required
-def remove_firewall():
-    data = request.get_json()
-    ip = data.get('ip')
-    if not ip:
-        return jsonify({"status": "error", "msg": "IP为空"})
-    try:
-        # 移除该IP所有的 DROP 规则
-        while True:
-            try:
-                subprocess.check_call(['iptables', '-D', 'INPUT', '-s', ip, '-j', 'DROP'], stderr=subprocess.DEVNULL)
-            except subprocess.CalledProcessError:
-                break
-        socketio.emit('sys_log', {'msg': f"手动解封: 已解除对 {ip} 的阻断", 'type': 'unban'})
-        return jsonify({"status": "success", "msg": f"已解除对 {ip} 的阻断"})
-    except Exception as e:
-        return jsonify({"status": "error", "msg": str(e)}), 500
+_IP_V4_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
 
 
-@socketio.on('connect')
-def on_connect():
-    """客户端连接时，校验登录状态并推送全量历史数据"""
-    if not session.get('logged_in'):
-        return False  # 在握手阶段直接拒绝，未登录用户无法建立连接
-    emit('init', locations)
+def parse_remote_ip(addr: str) -> str:
+    """从 frps 提供的 remote_addr 中提取纯 IP (兼容 IPv4 / IPv6)"""
+    if not addr:
+        return ""
+    if addr.startswith("["):           # [::1]:port
+        return addr.split("]")[0][1:]
+    if ":" in addr:                    # 1.2.3.4:port
+        return addr.rsplit(":", 1)[0]
+    return addr
 
 
-if __name__ == '__main__':
-    t = Thread(target=watch_log, daemon=True)
-    t.start()
-    host = config.get('web_host', '0.0.0.0')
-    port = config.get('web_port', 5008)
-    print(f"Web 服务已启动，请访问 http://127.0.0.1:{port}")
+# ═══════════════════════════════════════════════════════════
+#  应用工厂
+# ═══════════════════════════════════════════════════════════
+
+
+def create_app() -> tuple[Flask, SocketIO, ConfigManager]:
+    """构建 Flask 应用, 注入所有服务"""
+
+    base_dir = Path(__file__).parent
+    cfg = ConfigManager(base_dir / "config.json")
+
+    app = Flask(__name__)
+    app.secret_key = cfg.get("secret_key", os.urandom(24).hex())
+    sio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+
+    geo = GeoService()
+    bans = BanManager(cfg)
+    tracker = ConnectionTracker(geo, sio)
+
+    # ── 认证装饰器 ──
+
+    def login_required(f):
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            if not session.get("logged_in"):
+                return redirect(url_for("login", next=request.url))
+            return f(*args, **kwargs)
+        return wrapper
+
+    # ── frp Server Plugin 端点 ────────────────────────────
+
+    @app.route("/frp-plugin", methods=["POST"])
+    def frp_plugin():
+        op = request.args.get("op", "")
+        content = (request.get_json(silent=True) or {}).get("content", {})
+
+        proxy = content.get("proxy_name", "")
+        raw_addr = content.get("remote_addr", "")
+        ip = parse_remote_ip(raw_addr)
+
+        # ── CloseUserConn: 连接断开通知 ──
+        if op == "CloseUserConn":
+            if ip:
+                tracker.close_connection(ip, proxy, raw_addr)
+            return jsonify({"reject": False, "unchange": True})
+
+        # ── 非 NewUserConn 一律放行 ──
+        if op != "NewUserConn":
+            return jsonify({"reject": False, "unchange": True})
+
+        if not ip:
+            return jsonify({"reject": False, "unchange": True})
+
+        # ── 异步补全拦截记录的地理信息 ──
+        def _backfill_geo(rec: dict, ip: str):
+            g = geo.lookup(ip)
+            if g:
+                rec["desc"] = g.desc
+                rec["country"] = g.country
+                sio.emit("blocked_geo_update", rec)
+
+        # ① 已在黑名单 → 直接拒绝 (<1 ms)
+        if bans.is_banned(ip):
+            count = bans.increment_blocked()
+            cached = geo.get_cached(ip)
+            desc = cached.desc if cached else ""
+            ctry = cached.country if cached else ""
+            rec = bans.log_blocked(ip, proxy, "已封禁", desc, ctry)
+            sio.emit("sys_log", {"msg": f"拦截: {ip} → {proxy} (已封禁)"})
+            sio.emit("blocked_update", {"blocked": count})
+            sio.emit("blocked_event", rec)
+            if not cached:
+                Thread(target=_backfill_geo, args=(rec, ip), daemon=True).start()
+            return jsonify({"reject": True, "reject_reason": "banned by frp_pv"})
+
+        # ② 滑动窗口自动封禁检测
+        cached_geo = geo.get_cached(ip)
+        country = cached_geo.country if cached_geo else ""
+        if bans.check_auto_ban(ip, proxy, country):
+            desc = cached_geo.desc if cached_geo else ""
+            rec = bans.log_blocked(ip, proxy, "自动封禁", desc, country)
+            sio.emit("sys_log", {"msg": f"自动封禁: {ip} (频繁连接 {proxy})"})
+            sio.emit("blocked_update", {"blocked": bans.blocked_count})
+            sio.emit("blocked_event", rec)
+            if not cached_geo:
+                Thread(target=_backfill_geo, args=(rec, ip), daemon=True).start()
+            return jsonify({
+                "reject": True,
+                "reject_reason": "auto-banned by frp_pv",
+            })
+
+        # ③ 放行 → 标记活跃 + 异步记录
+        tracker.open_connection(ip, proxy, raw_addr)
+        Thread(target=tracker.record, args=(ip, proxy, raw_addr), daemon=True).start()
+        return jsonify({"reject": False, "unchange": True})
+
+    # ── 认证路由 ──────────────────────────────────────────
+
+    @app.route("/login", methods=["GET", "POST"])
+    def login():
+        error = None
+        if request.method == "POST":
+            username = request.form.get("username")
+            password = request.form.get("password", "")
+            if username == cfg.get("admin_username", "root"):
+                cfg_hash = cfg.get("admin_password_hash", "")
+                if (not cfg_hash and password == "") or (
+                    cfg_hash and check_password_hash(cfg_hash, password)
+                ):
+                    session["logged_in"] = True
+                    return redirect(url_for("index"))
+                error = (
+                    "密码错误。当前默认无密码时请直接留空。"
+                    if not cfg_hash
+                    else "用户名或密码错误"
+                )
+            else:
+                error = "用户名或密码错误"
+        return render_template("login.html", error=error)
+
+    @app.route("/logout")
+    def logout():
+        session.pop("logged_in", None)
+        return redirect(url_for("login"))
+
+    # ── 页面 & 数据 ──────────────────────────────────────
+
+    @app.route("/")
+    @login_required
+    def index():
+        return render_template("index.html", config=cfg.raw)
+
+    @app.route("/api/data")
+    @login_required
+    def api_data():
+        return jsonify(tracker.all_records)
+
+    # ── 设置 API ──────────────────────────────────────────
+
+    @app.route("/api/settings", methods=["GET", "POST"])
+    @login_required
+    def api_settings():
+        if request.method == "GET":
+            return jsonify({
+                "status": "success",
+                "data": {
+                    "home_country": cfg.get("home_country", "中国"),
+                    "frequent_threshold": cfg.get("frequent_threshold", 5),
+                    "foreign_highlight": cfg.get("foreign_highlight", True),
+                    "admin_username": cfg.get("admin_username", "root"),
+                    "auto_ban": cfg.get("auto_ban", {}),
+                },
+            })
+
+        if not request.is_json:
+            return jsonify({"status": "error", "msg": "请求格式错误"}), 400
+
+        data = request.get_json()
+
+        # 密码变更
+        if data.get("change_pwd"):
+            old_pw = data.get("old_password", "")
+            new_pw = data.get("new_password", "")
+            cfg_hash = cfg.get("admin_password_hash", "")
+            if cfg_hash and not check_password_hash(cfg_hash, old_pw):
+                return jsonify({"status": "error", "msg": "原密码错误"})
+            if not cfg_hash and old_pw != "":
+                return jsonify({"status": "error", "msg": "原密码为空，请留空"})
+            cfg.set(
+                "admin_password_hash",
+                generate_password_hash(new_pw) if new_pw else "",
+            )
+
+        # 常规字段 — 逐个覆盖
+        for key in (
+            "home_country",
+            "frequent_threshold",
+            "foreign_highlight",
+            "auto_ban",
+            "admin_username",
+        ):
+            if key in data:
+                cfg.set(key, data[key])
+
+        cfg.save()
+        return jsonify({"status": "success", "msg": "设置保存成功！"})
+
+    # ── 封禁管理 API ─────────────────────────────────────
+
+    @app.route("/api/firewall", methods=["GET"])
+    @login_required
+    def get_firewall():
+        items = []
+        for i, ip in enumerate(bans.sorted_list(), 1):
+            g = geo.lookup(ip)
+            items.append({
+                "num": i,
+                "ip": ip,
+                "desc": g.desc if g else "",
+            })
+        return jsonify({"status": "success", "data": items})
+
+    @app.route("/api/firewall/add", methods=["POST"])
+    @login_required
+    def add_firewall():
+        ip = (request.get_json().get("ip") or "").strip()
+        if not ip or not _IP_V4_RE.match(ip):
+            return jsonify({"status": "error", "msg": "无效的 IP 地址"})
+        bans.ban(ip)
+        sio.emit("sys_log", {"msg": f"手动封禁: {ip}", "type": "ban"})
+        return jsonify({
+            "status": "success",
+            "msg": f"已封禁 {ip}，后续连接将被 frp 直接拒绝",
+        })
+
+    @app.route("/api/firewall/remove", methods=["POST"])
+    @login_required
+    def remove_firewall():
+        ip = (request.get_json().get("ip") or "").strip()
+        if not ip:
+            return jsonify({"status": "error", "msg": "IP 为空"})
+        bans.unban(ip)
+        sio.emit("sys_log", {"msg": f"解除封禁: {ip}", "type": "unban"})
+        return jsonify({"status": "success", "msg": f"已解除对 {ip} 的封禁"})
+
+    # ── WebSocket ─────────────────────────────────────────
+
+    @sio.on("connect")
+    def on_connect():
+        if not session.get("logged_in"):
+            return False
+        emit("init", tracker.all_records)
+        emit("blocked_update", {"blocked": bans.blocked_count})
+        emit("blocked_init", bans.blocked_list)
+        emit("active_init", tracker.active_list)
+        emit("connection_opened", {"active": tracker.active_count})
+
+    return app, sio, cfg
+
+
+# ═══════════════════════════════════════════════════════════
+#  模块级实例 (供 WSGI 部署 / 直接运行)
+# ═══════════════════════════════════════════════════════════
+
+app, socketio, _cfg = create_app()
+
+if __name__ == "__main__":
+    host = _cfg.get("web_host", "0.0.0.0")
+    port = _cfg.get("web_port", 5008)
+    print("=" * 56)
+    print("  FRP_PV — Server Plugin 模式")
+    print("=" * 56)
+    print("  在 frps.toml 末尾添加:")
+    print()
+    print("  [[httpPlugins]]")
+    print('  name = "frp-pv"')
+    print(f'  addr = "127.0.0.1:{port}"')
+    print('  path = "/frp-plugin"')
+    print('  ops = ["NewUserConn", "CloseUserConn"]')
+    print()
+    print(f"  Web UI: http://127.0.0.1:{port}")
+    print("=" * 56)
     socketio.run(app, host=host, port=port, debug=False, allow_unsafe_werkzeug=True)
