@@ -4,6 +4,7 @@
 #     "flask",
 #     "flask-socketio",
 #     "requests",
+#     "geoip2",
 # ]
 # ///
 
@@ -29,6 +30,12 @@ from threading import Lock, Thread
 from typing import Optional
 
 import requests as http_requests
+try:
+    import geoip2.database
+    import geoip2.errors
+    _GEOIP2_AVAILABLE = True
+except ImportError:
+    _GEOIP2_AVAILABLE = False
 from flask import (
     Flask,
     jsonify,
@@ -146,13 +153,37 @@ _PRIVATE_PREFIXES = ("127.", "192.168.", "10.", "172.")
 
 
 class GeoService:
-    """IP 地理信息查询 — ipwho.is 免费接口 + 内存缓存"""
+    """IP 地理信息查询——优先用本地 GeoLite2-City.mmdb，否则 ipwho.is"""
 
     API_URL = "http://ipwho.is/{ip}?lang=zh-CN"
     TIMEOUT = 5
+    MMDB_PATH = Path("GeoLite2-City.mmdb")
 
     def __init__(self) -> None:
         self._cache: dict[str, Optional[GeoInfo]] = {}
+        self._reader = None
+        if _GEOIP2_AVAILABLE and self.MMDB_PATH.exists():
+            try:
+                self._reader = geoip2.database.Reader(str(self.MMDB_PATH))
+                print(f"[GEO] 使用本地 GeoLite2 数据库: {self.MMDB_PATH}")
+            except Exception as e:
+                print(f"[GEO] GeoLite2 加载失败: {e}")
+
+    def _lookup_local(self, ip: str) -> Optional[GeoInfo]:
+        """GeoLite2 本地查询，精确到城市级"""
+        try:
+            r = self._reader.city(ip)
+            lat = r.location.latitude
+            lon = r.location.longitude
+            country = r.country.names.get("zh-CN") or r.country.name or ""
+            city = r.city.names.get("zh-CN") or r.city.name or ""
+            return GeoInfo(
+                lat=lat, lon=lon,
+                country=country,
+                desc=f"{country} - {city}".strip(" - "),
+            )
+        except Exception:
+            return None
 
     def lookup(self, ip: str) -> Optional[GeoInfo]:
         """查询并缓存; 内网 IP 直接返回 None"""
@@ -163,6 +194,14 @@ class GeoService:
             self._cache[ip] = None
             return None
 
+        # 优先本地数据库
+        if self._reader:
+            geo = self._lookup_local(ip)
+            if geo:
+                self._cache[ip] = geo
+                return geo
+
+        # 备用在线接口（ipwho.is）
         try:
             resp = http_requests.get(
                 self.API_URL.format(ip=ip), timeout=self.TIMEOUT
@@ -290,19 +329,25 @@ class EventLog:
     def push(self, kind: str, data: dict) -> None:
         self._log.append({"kind": kind, "data": data})
 
-    def push_sys(self, msg: str, log_type: str = "ban") -> None:
-        entry = {"msg": msg, "type": log_type,
+    def push_sys(self, msg: str, log_type: str = "ban", desc: str = "",
+                 ip: str = "", proxy: str = "", reason: str = "") -> None:
+        entry = {"msg": msg, "type": log_type, "desc": desc,
+                 "ip": ip, "proxy": proxy, "reason": reason,
                  "time": time.strftime("%Y-%m-%d %H:%M:%S")}
         self.push("sys", entry)
         self._sio.emit("sys_log", entry)
 
     def log_blocked(self, ip: str, proxy: str, reason: str,
-                    desc: str = "", country: str = "") -> dict:
+                    desc: str = "", country: str = "",
+                    lat: float = None, lon: float = None) -> dict:
         rec = {
             "ip": ip, "proxy": proxy, "reason": reason,
             "desc": desc, "country": country,
             "time": int(time.time()),
         }
+        if lat is not None and lon is not None:
+            rec["lat"] = lat
+            rec["lon"] = lon
         self.push("blocked", rec)
         return rec
 
@@ -479,16 +524,22 @@ def create_app() -> tuple[Flask, SocketIO, ConfigManager]:
         if g:
             rec["desc"] = g.desc
             rec["country"] = g.country
+            rec["lat"] = g.lat
+            rec["lon"] = g.lon
             sio.emit("blocked_geo_update", rec)
 
     def _reject_ip(ip: str, proxy: str, reason: str,
                    sys_msg: str, reject_reason: str):
         """记录拦截 → 广播事件 → 返回拒绝响应"""
         cached = geo.get_cached(ip)
+        lat = cached.lat if cached else None
+        lon = cached.lon if cached else None
         rec = elog.log_blocked(ip, proxy, reason,
                                cached.desc if cached else "",
-                               cached.country if cached else "")
-        elog.push_sys(sys_msg)
+                               cached.country if cached else "",
+                               lat=lat, lon=lon)
+        geo_desc = cached.desc if cached and cached.desc else ""
+        elog.push_sys(sys_msg, desc=geo_desc, ip=ip, proxy=proxy, reason=reason)
         sio.emit("blocked_update", {"blocked": bans.blocked_count})
         sio.emit("blocked_event", rec)
         if not cached:
@@ -661,6 +712,7 @@ def create_app() -> tuple[Flask, SocketIO, ConfigManager]:
             return jsonify({"status": "error", "msg": "IP 为空"})
         bans.unban(ip)
         elog.push_sys(f"解除封禁: {ip}", "unban")
+        sio.emit("unban_ip", {"ip": ip})
         return jsonify({"status": "success", "msg": f"已解除对 {ip} 的封禁"})
 
     # ── WebSocket ─────────────────────────────────────────

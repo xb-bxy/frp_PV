@@ -13,6 +13,8 @@ const ARC_LIFETIME_MS = (_cfg.arcLifetime || 3600) * 1000;
 const HOME_COUNTRY = _cfg.homeCountry || '中国';
 const FREQUENT_THRESHOLD = _cfg.frequentThreshold || 5;
 const GLOBE_IMAGE_URL = _cfg.globeImageUrl || '';
+const BUMP_IMAGE_URL = _cfg.bumpImageUrl || '//unpkg.com/three-globe/example/img/earth-topology.png';
+const CLOUD_IMAGE_URL = _cfg.cloudImageUrl || '//unpkg.com/three-globe/example/img/earth-clouds10k.png';
 let foreignHighlight = _cfg.foreignHighlight !== false;
 
 // ── 自定义对话框 ────────────────────────────────────────
@@ -65,132 +67,431 @@ function formatDuration(sec) {
     return Math.floor(sec / 3600) + 'h ' + Math.floor((sec % 3600) / 60) + 'm';
 }
 
-// ── Globe 初始化 ────────────────────────────────────────
-
-// 粒子贴图 (代替高耗能几何体)
-const canvas = document.createElement('canvas');
-canvas.width = 64; canvas.height = 64;
-const context = canvas.getContext('2d');
-const gradient = context.createRadialGradient(32, 32, 0, 32, 32, 32);
-gradient.addColorStop(0, 'rgba(255,255,255,1)');
-gradient.addColorStop(0.2, 'rgba(59, 130, 246, 1)');
-gradient.addColorStop(0.5, 'rgba(59, 130, 246, 0.5)');
-gradient.addColorStop(1, 'rgba(0,0,0,0)');
-context.fillStyle = gradient;
-context.fillRect(0, 0, 64, 64);
-const particleTexture = new THREE.CanvasTexture(canvas);
+// ── Cesium 初始化 ────────────────────────────────────────
 
 const globeContainer = document.getElementById('globe-container');
-const world = Globe()
-    (globeContainer)
-    .globeImageUrl(GLOBE_IMAGE_URL)
-    .backgroundColor('#030305')
-    .atmosphereAltitude(0.12)
-
-    // 自定义精灵层 (替代高耗能 point 组件)
-    .customLayerData([])
-    .customThreeObject(d => {
-        const group = new THREE.Group();
-
-        const foreign = foreignHighlight && !d.isTarget && d.country && d.country !== HOME_COUNTRY;
-        const material = new THREE.SpriteMaterial({
-            map: particleTexture,
-            color: d.isTarget ? 0xffffff : (foreign ? 0xff4444 : 0x3b82f6),
-            transparent: true,
-            blending: THREE.AdditiveBlending
-        });
-        const sprite = new THREE.Sprite(material);
-        sprite.scale.set(d.isTarget ? 4 : 2.5, d.isTarget ? 4 : 2.5, 1);
-        group.add(sprite);
-
-        if (!d.isTarget && d.desc) {
-            const textCanvas = document.createElement('canvas');
-            textCanvas.width = 512;
-            textCanvas.height = 128;
-            const ctx = textCanvas.getContext('2d');
-            ctx.font = 'bold 36px "Microsoft YaHei", sans-serif';
-            ctx.fillStyle = foreign ? '#ff6666' : '#93c5fd';
-            ctx.textAlign = 'center';
-            ctx.textBaseline = 'middle';
-            ctx.fillText(d.desc.replace(' - ', ' '), 256, 64);
-
-            const textTexture = new THREE.CanvasTexture(textCanvas);
-            textTexture.minFilter = THREE.LinearFilter;
-
-            const textMaterial = new THREE.SpriteMaterial({
-                map: textTexture,
-                transparent: true,
-                depthTest: false
-            });
-            const textSprite = new THREE.Sprite(textMaterial);
-            textSprite.position.set(0, 1.8, 0);
-            textSprite.scale.set(10, 2.5, 1);
-            group.add(textSprite);
+const viewer = new Cesium.Viewer(globeContainer, {
+    animation: false,
+    baseLayerPicker: true,
+    fullscreenButton: false,
+    vrButton: false,
+    geocoder: false,
+    homeButton: false,
+    infoBox: false,
+    sceneModePicker: false,
+    selectionIndicator: false,
+    timeline: false,
+    navigationHelpButton: false,
+    navigationInstructionsInitiallyVisible: false,
+    scene3DOnly: true,
+    shadows: false,
+    skyAtmosphere: new Cesium.SkyAtmosphere(),
+    skyBox: new Cesium.SkyBox({
+        sources: {
+            positiveX: 'https://unpkg.com/three-globe/example/img/earth-topology.png', // Fallback, Cesium provides default anyway
+            negativeX: 'https://unpkg.com/three-globe/example/img/earth-topology.png',
+            positiveY: 'https://unpkg.com/three-globe/example/img/earth-topology.png',
+            negativeY: 'https://unpkg.com/three-globe/example/img/earth-topology.png',
+            positiveZ: 'https://unpkg.com/three-globe/example/img/earth-topology.png',
+            negativeZ: 'https://unpkg.com/three-globe/example/img/earth-topology.png'
         }
-
-        return group;
-    })
-    .customThreeObjectUpdate((obj, d) => {
-        Object.assign(obj.position, world.getCoords(d.lat, d.lng, 0.01));
-    })
-
-    // 涟漪
-    .ringColor(d => foreignHighlight && d.country && d.country !== HOME_COUNTRY
-        ? 'rgba(239, 68, 68, 0.5)'
-        : 'rgba(59, 130, 246, 0.4)'
-    )
-    .ringMaxRadius(2)
-    .ringPropagationSpeed(1.5)
-    .ringRepeatPeriod(2000)
-    .ringResolution(12)
-
-    // 弧线
-    .arcStartLat(d => d.lat)
-    .arcStartLng(d => d.lng)
-    .arcEndLat(() => TARGET_LOC.lat)
-    .arcEndLng(() => TARGET_LOC.lng)
-    .arcColor(d => {
-        const isForeign = foreignHighlight && d.country && d.country !== HOME_COUNTRY;
-        if (d.arcType === 'base') {
-            return isForeign
-                ? ['rgba(239, 68, 68, 0.1)', 'rgba(239, 68, 68, 0.5)']
-                : ['rgba(59, 130, 246, 0.1)', 'rgba(59, 130, 246, 0.5)'];
-        } else {
-            return isForeign
-                ? ['rgba(255, 80, 80, 0.8)', 'rgba(255, 255, 255, 1)']
-                : ['rgba(130, 180, 255, 0.8)', 'rgba(255, 255, 255, 1)'];
-        }
-    })
-    .arcAltitudeAutoScale(0.3)
-    .arcStroke(d => d.arcType === 'base' ? 0.3 : 0.9)
-    .arcDashLength(d => d.arcType === 'base' ? 1 : 0.2)
-    .arcDashGap(d => d.arcType === 'base' ? 0 : 0.8)
-    .arcDashInitialGap(d => d.arcType === 'base' ? 0 : (d._randGap !== undefined ? d._randGap : Math.random()))
-    .arcDashAnimateTime(d => d.arcType === 'base' ? 0 : (d._randTime || 2500))
-    .arcsTransitionDuration(0);
-
-world.pointOfView({ lat: TARGET_LOC.lat - 15, lng: TARGET_LOC.lng + 10, altitude: 2.2 });
-world.controls().autoRotate = false;
-world.controls().enableZoom = true;
-
-window.addEventListener('resize', () => {
-    world.width(window.innerWidth);
-    world.height(window.innerHeight);
+    }) // We'll just use defaults where possible to keep it lightweight.
 });
 
-// ── Globe 数据 ──────────────────────────────────────────
+// Remove default base layer if we want a custom one, but default imagery is fine.
+// viewer.scene.globe.enableLighting = true;
+viewer.scene.backgroundColor = Cesium.Color.fromCssColorString('#030305');
+
+// 去除底部 Cesium logo 标志
+viewer.cesiumWidget.creditContainer.style.display = "none";
+
+// 隐藏原右上角工具栏
+viewer.baseLayerPicker.container.style.display = 'none';
+
+// 在标题旁新建独立的 BaseLayerPicker（中文化）
+(function createTitlePicker() {
+    const logoEl = document.querySelector('.overlay-title-row');
+    const pickerContainer = document.createElement('div');
+    pickerContainer.id = 'title-layer-picker';
+    logoEl.appendChild(pickerContainer);
+
+    const imageryVMs = viewer.baseLayerPicker.viewModel.imageryProviderViewModels;
+    const terrainVMs = viewer.baseLayerPicker.viewModel.terrainProviderViewModels;
+
+    // 翻译底图名称
+    const nameMap = {
+        'Bing Maps Aerial': '必应卫星图',
+        'Bing Maps Aerial with Labels': '必应卫星图+标注',
+        'Bing Maps Roads': '必应道路图',
+        'Sentinel-2': '哨兵-2',
+        'Blue Marble': '蓝色弹珠',
+        'Earth at night': '夜间地球',
+        'Natural Earth II': '自然地球 II',
+        'Google Maps Satellite': '谷歌卫星图',
+        'Google Maps Satellite with Labels': '谷歌卫星图+标注',
+        'Google Maps Roadmap': '谷歌道路图',
+        'Google Maps Contour': '谷歌等高线',
+        'Azure Maps Aerial': 'Azure 卫星图',
+        'WGS84 Ellipsoid': 'WGS84 椭球体',
+        'Cesium World Terrain': 'Cesium 世界地形',
+        'STK World Terrain': 'STK 世界地形',
+        'Ellipsoid': '椭球体（无地形）',
+    };
+    [...imageryVMs, ...terrainVMs].forEach(vm => {
+        const cn = nameMap[vm.name];
+        if (cn) vm.name = cn;
+    });
+
+    const picker = new Cesium.BaseLayerPicker(pickerContainer, {
+        globe: viewer.scene.globe,
+        imageryProviderViewModels: imageryVMs,
+        terrainProviderViewModels: terrainVMs
+    });
+
+    // 恢复上次保存的底图选择
+    const STORAGE_KEY = 'frp_pv_imagery';
+    const savedName = localStorage.getItem(STORAGE_KEY);
+    if (savedName) {
+        const vm = imageryVMs.find(v => v.name === savedName);
+        if (vm) picker.viewModel.selectedImagery = vm;
+    }
+
+    // 每次切换时保存到 localStorage
+    picker.viewModel.selectedImageryChanged = new Cesium.Event();
+    Cesium.knockout.getObservable(picker.viewModel, 'selectedImagery').subscribe(function(vm) {
+        if (vm && vm.name) localStorage.setItem(STORAGE_KEY, vm.name);
+    });
+
+    // 用 MutationObserver 在下拉框出现时替换英文标签
+    const labelMap = { 'Imagery': '底图', 'Terrain': '地形' };
+    function translatePickerDOM(root) {
+        root.querySelectorAll('.cesium-baseLayerPicker-sectionTitle').forEach(el => {
+            const cn = labelMap[el.textContent.trim()];
+            if (cn) el.textContent = cn;
+        });
+    }
+    const dropDown = pickerContainer.querySelector('.cesium-baseLayerPicker-dropDown');
+    if (dropDown) {
+        translatePickerDOM(dropDown);
+        new MutationObserver(() => translatePickerDOM(dropDown))
+            .observe(dropDown, { childList: true, subtree: true, characterData: true });
+    }
+})();
+
+viewer.camera.flyTo({
+    destination: Cesium.Cartesian3.fromDegrees(TARGET_LOC.lng + 10, TARGET_LOC.lat - 15, 10000000)
+});
+
+window.addEventListener('resize', () => {
+    viewer.resize();
+});
+
+// ── Cesium 数据 ──────────────────────────────────────────
 
 const logStream = document.getElementById('log-stream');
 const allLogsStream = document.getElementById('all-logs-stream');
 let attackPointsData = [], attackArcsData = [], attackRingsData = [];
 
-function updateGlobeThreatData() {
-    const fullData = attackPointsData.concat([{ ...TARGET_LOC, isTarget: true }]);
-    world.customLayerData(fullData);
-    world.arcsData(attackArcsData);
-    world.ringsData(attackRingsData);
+// === 自定义 Fabric 飞线材质 ===
+function FlyingLineMaterialProperty(color, duration) {
+    this._definitionChanged = new Cesium.Event();
+    this.color = color;
+    this.duration = duration || 2000;
+    this._time = performance.now();
+}
+Object.defineProperties(FlyingLineMaterialProperty.prototype, {
+    isConstant: { get: function () { return false; } },
+    definitionChanged: { get: function () { return this._definitionChanged; } }
+});
+FlyingLineMaterialProperty.prototype.getType = function () {
+    return 'FlyingLine';
+};
+FlyingLineMaterialProperty.prototype.getValue = function (time, result) {
+    if (!Cesium.defined(result)) result = {};
+    // Fix: color might be a raw Cesium.Color instead of a Property
+    result.color = Cesium.Property.getValueOrClonedDefault(
+        this.color instanceof Cesium.Property ? this.color : new Cesium.ConstantProperty(this.color), 
+        time, 
+        Cesium.Color.WHITE, 
+        result.color
+    );
+    result.time = ((performance.now() - this._time) % this.duration) / this.duration;
+    return result;
+};
+FlyingLineMaterialProperty.prototype.equals = function (other) {
+    return this === other || (other instanceof FlyingLineMaterialProperty && Cesium.Property.equals(this.color, other.color));
+};
+
+if (!Cesium.Material._materialCache.getMaterial('FlyingLine')) {
+    Cesium.Material._materialCache.addMaterial('FlyingLine', {
+        fabric: {
+            type: 'FlyingLine',
+            uniforms: { color: new Cesium.Color(1.0, 0.0, 0.0, 1.0), time: 0.0 },
+            source: `
+                czm_material czm_getMaterial(czm_materialInput materialInput) {
+                    czm_material material = czm_getDefaultMaterial(materialInput);
+                    vec2 st = materialInput.st;
+                    // 流动效果：计算相对于当前时间 time 的距离
+                    float t = fract(st.s - time);
+                    // 头部亮，尾部暗的飞线拖尾
+                    float strength = smoothstep(0.0, 0.5, t) * (1.0 - smoothstep(0.5, 1.0, t));
+                    float alpha = pow(t, 2.0); // 尾部渐变
+                    material.diffuse = color.rgb;
+                    material.alpha = color.a * alpha * 2.0;
+                    return material;
+                }
+            `
+        },
+        translucent: function () { return true; }
+    });
 }
 
+// === 自定义屏蔽虚线材质 ===
+// === X 标记 Billboard 图像 (封禁连接用，一次性创建) ===
+const _xMarkerCanvas = (() => {
+    const c = document.createElement('canvas');
+    c.width = 48; c.height = 48;
+    const ctx = c.getContext('2d');
+    ctx.strokeStyle = 'rgba(255, 50, 50, 1.0)';
+    ctx.lineWidth = 3;  // 笔划细
+    ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(8, 8); ctx.lineTo(40, 40); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(40, 8); ctx.lineTo(8, 40); ctx.stroke();
+    return c;
+})();
+
+function addBlockedXMarkers(lineId, arcPositions) {
+    [0.25, 0.5, 0.75].forEach((frac, i) => {
+        const markerId = `arcx_${lineId}_${i}`;
+        if (!viewer.entities.getById(markerId)) {
+            const idx = Math.max(0, Math.min(arcPositions.length - 1,
+                Math.floor(frac * (arcPositions.length - 1))));
+            viewer.entities.add({
+                id: markerId,
+                position: arcPositions[idx],
+                billboard: {
+                    image: _xMarkerCanvas,
+                    width: 36,   // 显示大一些
+                    height: 36,
+                    verticalOrigin: Cesium.VerticalOrigin.CENTER,
+                    horizontalOrigin: Cesium.HorizontalOrigin.CENTER
+                }
+            });
+        }
+    });
+}
+
+function removeBlockedXMarkers(lineId) {
+    [0, 1, 2].forEach(i => {
+        const xEnt = viewer.entities.getById(`arcx_${lineId}_${i}`);
+        if (xEnt) viewer.entities.remove(xEnt);
+    });
+}
+
+// === 自适应线宽 (根据相机高度缩放) ===
+function makeAdaptiveWidth(baseWidth) {
+    return new Cesium.CallbackProperty(() => {
+        const alt = viewer.camera.positionCartographic.height;
+        // 越放大（alt越小）线越细；全球视角（alt~10000km）保持粗线
+        // scale: alt=2e7(全球) -> 2.0, alt=5e6(大陆) -> 1.0, alt=5e5(城市) -> 0.3
+        const scale = Math.min(2.5, Math.max(0.2, alt / 1e7));
+        return baseWidth * scale;
+    }, false);
+}
+
+// === 3D 高度圆弧生成函数 ===
+function compute3DArcPositions(lng1, lat1, lng2, lat2, segments) {
+    const startCarto = Cesium.Cartographic.fromDegrees(lng1, lat1);
+    const endCarto = Cesium.Cartographic.fromDegrees(lng2, lat2);
+    const geodesic = new Cesium.EllipsoidGeodesic(startCarto, endCarto);
+    const dist = geodesic.surfaceDistance;
+    // 越远弧越高，设置最小弧高 120km 就〠距离财子市内也能显示
+    const MIN_HEIGHT = 120000;
+    const rawHeight = dist < 500000 ? dist * 0.3
+                    : dist < 2000000 ? dist * 0.2
+                    : dist * 0.18;
+    const maxHeight = Math.max(rawHeight, MIN_HEIGHT);
+    const segs = segments || (dist < 200000 ? 12 : dist < 500000 ? 20 : dist < 2000000 ? 35 : 50);
+
+    const positions = [];
+    for (let i = 0; i <= segs; i++) {
+        const fraction = i / segs;
+        const pt = geodesic.interpolateUsingFraction(fraction);
+        const currentHeight = Math.sin(fraction * Math.PI) * maxHeight;
+        positions.push(Cesium.Cartesian3.fromRadians(pt.longitude, pt.latitude, currentHeight));
+    }
+    return positions;
+}
+
+function updateGlobeThreatData() {
+    // 使用基于 ID 的增量更新替换 removeAll，防止闪烁
+    const currentIds = new Set(['server_target']);
+    
+    // 渲染基站 (Target) 仅在不存在时添加
+    if (!viewer.entities.getById('server_target')) {
+        viewer.entities.add({
+            id: 'server_target',
+            position: Cesium.Cartesian3.fromDegrees(TARGET_LOC.lng, TARGET_LOC.lat),
+            point: {
+                pixelSize: 10,
+                color: Cesium.Color.WHITE,
+                outlineColor: Cesium.Color.fromCssColorString('#3b82f6'),
+                outlineWidth: 2
+            },
+            label: {
+                text: 'Server',
+                font: '14pt sans-serif',
+                style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+                outlineWidth: 2,
+                verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
+                pixelOffset: new Cesium.Cartesian2(0, -9)
+            }
+        });
+    }
+
+    // IP 状态判断：活跃 (active) 或 封禁 (blocked)
+    const isBlockedIp = (ip) => activeBannedIps.has(ip);
+    const isActiveIp = (ip) => {
+        for (const conn of activeConnections.values()) {
+            if (conn.ip === ip) return true;
+        }
+        return false;
+    };
+
+    // 渲染攻击源点 (支持状态动态更新)
+    attackPointsData.forEach(d => {
+        const pointId = `pt_${d.lng}_${d.lat}`;
+        currentIds.add(pointId);
+
+        const blocked = isBlockedIp(d.ip);
+        const active = isActiveIp(d.ip);
+        
+        let pColor, lColor;
+        if (blocked) {
+            pColor = Cesium.Color.RED;
+            lColor = Cesium.Color.fromCssColorString('#ff6666');
+        } else if (active) {
+            pColor = Cesium.Color.GREEN;
+            lColor = Cesium.Color.fromCssColorString('#86efac');
+        } else {
+            const isForeign = foreignHighlight && d.country && d.country !== HOME_COUNTRY;
+            pColor = isForeign ? Cesium.Color.RED : Cesium.Color.fromCssColorString('#3b82f6');
+            lColor = isForeign ? Cesium.Color.fromCssColorString('#ff6666') : Cesium.Color.fromCssColorString('#93c5fd');
+        }
+
+        const pointEntity = viewer.entities.getById(pointId);
+        if (!pointEntity) {
+            viewer.entities.add({
+                id: pointId,
+                position: Cesium.Cartesian3.fromDegrees(d.lng, d.lat),
+                point: {
+                    pixelSize: 6,
+                    color: pColor
+                },
+                label: d.desc ? {
+                    text: d.desc,
+                    font: '12pt sans-serif',
+                    fillColor: lColor,
+                    style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+                    outlineWidth: 1,
+                    verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
+                    pixelOffset: new Cesium.Cartesian2(0, -9)
+                } : undefined
+            });
+            const pEnt = viewer.entities.getById(pointId);
+            if (pEnt) pEnt._ipState = blocked ? 'blocked' : (active ? 'active' : 'historical');
+        } else {
+            const newState = blocked ? 'blocked' : (active ? 'active' : 'historical');
+            if (pointEntity._ipState !== newState) {
+                pointEntity.point.color = pColor;
+                if (pointEntity.label) pointEntity.label.fillColor = lColor;
+                pointEntity._ipState = newState;
+            }
+        }
+    });
+
+    // 渲染连线 (3 种线状态: 封禁=X+线段静态, 活跃=流光动画, 历史=静态纯色)
+    attackArcsData.filter(d => d.arcType === 'base').forEach(d => {
+        const lineId = `arc_${d.lng}_${d.lat}`;
+        currentIds.add(lineId);
+
+        const blocked = isBlockedIp(d.ip);
+        const active = isActiveIp(d.ip);
+        const newState = blocked ? 'blocked' : (active ? 'active' : 'historical');
+
+        // 封禁状态的 X 标记实体也加入 currentIds
+        if (blocked) {
+            [0, 1, 2].forEach(i => currentIds.add(`arcx_${lineId}_${i}`));
+        }
+
+        let lineColor, material, lineWidth;
+        if (blocked) {
+            // 封禁连接：红色虚线 + 沿线三个 X billboard 标记
+            lineColor = Cesium.Color.RED.withAlpha(0.8);
+            material = new Cesium.PolylineDashMaterialProperty({
+                color: lineColor,
+                dashLength: 40.0,   // 较长的断居，线段更稀疆
+                gapColor: Cesium.Color.TRANSPARENT
+            });
+            lineWidth = makeAdaptiveWidth(4);  // 封禁线细了
+        } else if (active) {
+            // 活跃连接：保持流光动画，绿色
+            lineColor = Cesium.Color.GREEN;
+            material = new FlyingLineMaterialProperty(lineColor, 800 + Math.random() * 500);
+            lineWidth = makeAdaptiveWidth(4);  // 活跃线
+        } else {
+            // 非活跃/历史连接：静态纯色线，无动画
+            const isForeign = foreignHighlight && d.country && d.country !== HOME_COUNTRY;
+            lineColor = isForeign ? Cesium.Color.RED.withAlpha(0.85) : Cesium.Color.fromCssColorString('#60a5fa').withAlpha(0.85);
+            material = new Cesium.ColorMaterialProperty(lineColor);
+            lineWidth = makeAdaptiveWidth(2.5);  // 历史线
+        }
+
+        const lineEntity = viewer.entities.getById(lineId);
+        if (!lineEntity) {
+            const arcPositions = compute3DArcPositions(d.lng, d.lat, TARGET_LOC.lng, TARGET_LOC.lat);
+            const ent = viewer.entities.add({
+                id: lineId,
+                polyline: {
+                    positions: arcPositions,
+                    width: lineWidth,
+                    material: material
+                }
+            });
+            ent._ipState = newState;
+            if (blocked) addBlockedXMarkers(lineId, arcPositions);
+        } else if (lineEntity._ipState !== newState) {
+            // 状态变更：若原来是封禁状态需先清除 X 标记
+            if (lineEntity._ipState === 'blocked') removeBlockedXMarkers(lineId);
+            viewer.entities.remove(lineEntity);
+            const arcPositions = compute3DArcPositions(d.lng, d.lat, TARGET_LOC.lng, TARGET_LOC.lat);
+            const ent = viewer.entities.add({
+                id: lineId,
+                polyline: {
+                    positions: arcPositions,
+                    width: lineWidth,
+                    material: material
+                }
+            });
+            ent._ipState = newState;
+            if (blocked) addBlockedXMarkers(lineId, arcPositions);
+        }
+    });
+
+    // 移除过期实体
+    const entitiesToRemove = [];
+    viewer.entities.values.forEach(entity => {
+        if (!currentIds.has(entity.id)) {
+            entitiesToRemove.push(entity);
+        }
+    });
+    
+    entitiesToRemove.forEach(entity => {
+        if (entity.id && (entity.id.startsWith('pt_') || entity.id.startsWith('arc_') || entity.id.startsWith('arcx_'))) {
+            viewer.entities.remove(entity);
+        }
+    });
+}
 // ── WebSocket 连接 ──────────────────────────────────────
 
 const wsIndicator = document.getElementById('ws-indicator');
@@ -244,14 +545,14 @@ socket.on('update_ip', (data) => {
 });
 
 socket.on('sys_log', (data) => {
-    addSysLogEntry(data.msg, data.type);
+    addSysLogEntry(data.msg, data.type, data.desc || '', data.ip || '', data.proxy || '', data.reason || '');
 });
 
 socket.on('event_log_init', (logs) => {
     (logs || []).forEach(e => {
         if (e.kind === 'conn') addLogEntry(e.data);
         else if (e.kind === 'disconn') addDisconnectLogEntry(e.data);
-        else if (e.kind === 'sys') addSysLogEntry(e.data.msg, e.data.type);
+        else if (e.kind === 'sys') addSysLogEntry(e.data.msg, e.data.type, e.data.desc || '', e.data.ip || '', e.data.proxy || '', e.data.reason || '');
     });
 });
 
@@ -357,9 +658,12 @@ function renderActiveTable() {
 // ── 端口悬浮提示 (fixed positioning) ────────────────────
 
 const portTip = document.getElementById('port-tooltip');
+let _portTipTarget = null;
+
 document.addEventListener('mouseover', function (e) {
     const badge = e.target.closest('.port-badge');
     if (!badge || !badge.dataset.ports) return;
+    _portTipTarget = badge;
     const ports = JSON.parse(badge.dataset.ports);
     const nowSec = Math.floor(Date.now() / 1000);
     let html = '<div class="port-tip-header">源端口 / 连接时长</div>';
@@ -377,12 +681,35 @@ document.addEventListener('mouseover', function (e) {
         portTip.style.top = (rect.bottom + 8) + 'px';
     }
 });
-document.addEventListener('mouseout', function (e) {
-    const badge = e.target.closest('.port-badge');
-    if (badge) portTip.style.display = 'none';
+
+document.addEventListener('mouseover', function (e) {
+    // 鼠标移到其他非 badge 元素时隐藏
+    if (!e.target.closest('.port-badge') && !e.target.closest('#port-tooltip') && _portTipTarget) {
+        portTip.style.display = 'none';
+        _portTipTarget = null;
+    }
 });
 
+document.addEventListener('mouseleave', function () {
+    portTip.style.display = 'none';
+    _portTipTarget = null;
+});
+
+document.addEventListener('click', function (e) {
+    if (!e.target.closest('.port-badge')) {
+        portTip.style.display = 'none';
+        _portTipTarget = null;
+    }
+});
+
+document.addEventListener('scroll', function () {
+    portTip.style.display = 'none';
+    _portTipTarget = null;
+}, true);
+
 // ── 拦截记录追踪 ────────────────────────────────────────
+
+const activeBannedIps = new Set(); // 当前实际封禁中的 IP
 
 socket.on('blocked_update', (data) => {
     document.getElementById('blocked-count').innerText = data.blocked || 0;
@@ -392,16 +719,48 @@ const blockedRecords = [];
 
 socket.on('blocked_init', (list) => {
     blockedRecords.length = 0;
+    activeBannedIps.clear();
     if (Array.isArray(list)) {
-        list.forEach(r => blockedRecords.push(r));
+        list.forEach(r => {
+            blockedRecords.push(r);
+            if (r.ip) activeBannedIps.add(r.ip);
+        });
     }
     renderBlockedTable();
+    updateGlobeThreatData();
 });
 
 socket.on('blocked_event', (rec) => {
     blockedRecords.push(rec);
+    if (rec.ip) activeBannedIps.add(rec.ip);
     if (blockedRecords.length > 200) blockedRecords.splice(0, blockedRecords.length - 200);
     renderBlockedTable();
+
+    // 若 blocked_event 携带了经纬度（封禁名单内 IP 再次访问），需注入绘图数据
+    if (rec.ip && rec.lat && rec.lon) {
+        // 检查 allIpData 里是否已有此 IP 的地理数据，没有则注入一条虚拟记录供画线用
+        const existing = allIpData.find(d => d.ip === rec.ip && d.lat && d.lon);
+        if (!existing) {
+            const ghost = {
+                ip: rec.ip, lat: rec.lat, lon: rec.lon,
+                desc: rec.desc || '', country: rec.country || '',
+                count: 1, time: new Date().toISOString(), _ghost: true
+            };
+            allIpData.push(ghost);
+        }
+        updateFromData(allIpData);
+    } else {
+        // 已有线条则刷新状态
+        updateGlobeThreatData();
+    }
+});
+
+socket.on('unban_ip', (data) => {
+    if (data && data.ip) {
+        activeBannedIps.delete(data.ip);
+        // 解封后刷新地球线条状态（封禁→历史/活跃）
+        updateGlobeThreatData();
+    }
 });
 
 socket.on('blocked_geo_update', (rec) => {
@@ -414,6 +773,27 @@ socket.on('blocked_geo_update', (rec) => {
         }
     }
     renderBlockedTable();
+
+    // 若补全了经纬度，更新 allIpData 中的 ghost 记录并触发画线
+    if (rec.ip && rec.lat && rec.lon) {
+        const ghost = allIpData.find(d => d.ip === rec.ip && d._ghost);
+        if (ghost) {
+            ghost.lat = rec.lat;
+            ghost.lon = rec.lon;
+            ghost.desc = rec.desc || ghost.desc;
+            ghost.country = rec.country || ghost.country;
+            delete ghost._mappedData; // 清除缓存的 mapped 数据，强制重建
+            delete ghost._baseArc;
+            delete ghost._animArc;
+        } else if (!allIpData.find(d => d.ip === rec.ip && d.lat && d.lon)) {
+            allIpData.push({
+                ip: rec.ip, lat: rec.lat, lon: rec.lon,
+                desc: rec.desc || '', country: rec.country || '',
+                count: 1, time: new Date().toISOString(), _ghost: true
+            });
+        }
+        updateFromData(allIpData);
+    }
 });
 
 function openBlockedModal() {
@@ -518,7 +898,7 @@ function addLogEntry(loc) {
     if (allLogsStream.children.length > 1000) allLogsStream.removeChild(allLogsStream.lastChild);
 }
 
-function addSysLogEntry(msg, type) {
+function addSysLogEntry(msg, type, desc, ip, proxy, reason) {
     const entry = document.createElement('div');
     entry.className = 'log-entry';
 
@@ -532,10 +912,23 @@ function addSysLogEntry(msg, type) {
     const now = new Date();
     const timeStr = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}`;
 
-    const innerHTML = `
-        <div><span class="timestamp" style="color: ${color}">[${timeStr}] ${title}</span></div>
-        <span class="geo" style="color: ${type === 'unban' ? '#34d399' : '#f87171'}; font-weight: bold; margin-top: 4px; display: block;">${msg}</span>
-    `;
+    let mainLine;
+    if (ip && proxy) {
+        // 拦截/自动封禁：显示 IP + 模块强调样式 + reason 标签
+        const reasonBadge = reason
+            ? `<span class="module-badge" style="background:rgba(239,68,68,0.15);color:#f87171;border-color:rgba(239,68,68,0.3);">${reason}</span>`
+            : '';
+        const moduleBadge = `<span class="module-badge" style="background:rgba(239,68,68,0.12);color:#fca5a5;border-color:rgba(239,68,68,0.25);">${proxy}</span>`;
+        mainLine = `<span class="timestamp" style="color:${color}">[${timeStr}] ${title}</span> <strong>${ip}</strong>${moduleBadge}${reasonBadge}`;
+    } else {
+        // 手动封禁/解除封禁：保持原来简洁文本格式
+        mainLine = `<span class="timestamp" style="color:${color}">[${timeStr}] ${title}</span> <strong>${msg}</strong>`;
+    }
+
+    const geoLine = desc ? `<span class="geo">${desc}</span>` : '';
+    const innerHTML = `<div>${mainLine}</div>${geoLine}`;
+
+    entry.innerHTML = innerHTML;
 
     entry.innerHTML = innerHTML;
     logStream.insertBefore(entry, logStream.firstChild);

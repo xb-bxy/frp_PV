@@ -4,9 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>FRP 全球态势感知</title>
-    <!-- 核心 3D 库 -->
-    <script src="{{ url_for('static', filename='js/three.min.js') }}"></script>
-    <script src="{{ url_for('static', filename='js/globe.gl.min.js') }}"></script>
+    <!-- 核心 3D 库 (Cesium) -->
+    <link href="https://unpkg.com/cesium/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
+    <script src="https://unpkg.com/cesium/Build/Cesium/Cesium.js"></script>
     <script src="{{ url_for('static', filename='js/socket.io.min.js') }}"></script>
     <!-- 主样式 -->
     <link rel="stylesheet" href="{{ url_for('static', filename='css/main.css') }}">
@@ -15,7 +15,9 @@
 
 <!-- ── Logo & 连接状态 ──────────────────────────────── -->
 <div class="overlay-logo">
-    FRP 访问态势感知
+    <div class="overlay-title-row">
+        FRP 访问态势感知
+    </div>
     <div class="ws-status-row"><i class="live-indicator connecting" id="ws-indicator"></i><span id="ws-status">服务连接中...</span></div>
 </div>
 
@@ -272,7 +274,9 @@
         homeCountry: "{{ config.home_country | default('中国') }}",
         frequentThreshold: {{ config.get('frequent_threshold', 5) }},
         foreignHighlight: {{ 'true' if config.get('foreign_highlight', True) else 'false' }},
-        globeImageUrl: "{{ url_for('static', filename='img/earth-blue-marble.jpg') }}"
+        globeImageUrl: "{{ url_for('static', filename='img/earth-blue-marble.jpg') }}",
+        bumpImageUrl: "//unpkg.com/three-globe/example/img/earth-topology.png",
+        cloudImageUrl: "//unpkg.com/three-globe/example/img/earth-clouds10k.png",
     };
 </script>
 <!-- 主脚本 -->

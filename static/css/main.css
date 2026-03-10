@@ -226,6 +226,38 @@ body, html {
     position: absolute; top: 45px; left: 50px; color: #ffffff;
     font-size: 24px; font-weight: 600; letter-spacing: 1px;
     z-index: 10; pointer-events: none;
+    display: flex; flex-direction: column; align-items: flex-start; gap: 6px;
+}
+
+.overlay-title-row {
+    display: flex; align-items: center; gap: 14px;
+}
+
+/* 底图选择器嵌入标题旁 */
+#title-layer-picker {
+    display: inline-flex;
+    align-items: center;
+    pointer-events: auto;
+    position: relative;
+}
+#title-layer-picker .cesium-baseLayerPicker-button {
+    width: 32px;
+    height: 32px;
+    border-radius: 6px;
+    border: 1px solid rgba(255,255,255,0.2);
+    background: rgba(20,24,36,0.75);
+    backdrop-filter: blur(4px);
+    cursor: pointer;
+}
+#title-layer-picker .cesium-baseLayerPicker-button:hover {
+    background: rgba(59,130,246,0.35);
+    border-color: rgba(96,165,250,0.6);
+}
+#title-layer-picker .cesium-baseLayerPicker-dropDown {
+    position: absolute;
+    top: 40px;
+    left: 0;
+    right: auto;
 }
 
 .ws-status-row {
