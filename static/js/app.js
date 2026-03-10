@@ -219,7 +219,6 @@ socket.on('connect_error', () => setWsStatus('disconnected'));
 socket.on('init', (data) => {
     allIpData = data;
     updateFromData(data);
-    data.forEach(loc => addLogEntry(loc));
 });
 
 socket.on('new_ip', (loc) => {
@@ -246,6 +245,14 @@ socket.on('update_ip', (data) => {
 
 socket.on('sys_log', (data) => {
     addSysLogEntry(data.msg, data.type);
+});
+
+socket.on('event_log_init', (logs) => {
+    (logs || []).forEach(e => {
+        if (e.kind === 'conn') addLogEntry(e.data);
+        else if (e.kind === 'disconn') addDisconnectLogEntry(e.data);
+        else if (e.kind === 'sys') addSysLogEntry(e.data.msg, e.data.type);
+    });
 });
 
 // ── 活跃连接追踪 ────────────────────────────────────────
