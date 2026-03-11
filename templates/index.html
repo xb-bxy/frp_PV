@@ -268,15 +268,13 @@
 <!-- ── Jinja 配置注入 (仅此处依赖模板引擎) ───────── -->
 <script>
     window.APP_CONFIG = {
-        serverLat: {{ config.server_location.lat }},
-        serverLng: {{ config.server_location.lng }},
+        serverLat: {{ server_geo.lat if server_geo else 0 }},
+        serverLng: {{ server_geo.lon if server_geo else 0 }},
+        serverDesc: "{{ server_geo.desc if server_geo else '' }}",
         arcLifetime: {{ config.arc_lifetime_seconds | default(3600) }},
         homeCountry: "{{ config.home_country | default('中国') }}",
         frequentThreshold: {{ config.get('frequent_threshold', 5) }},
         foreignHighlight: {{ 'true' if config.get('foreign_highlight', True) else 'false' }},
-        globeImageUrl: "{{ url_for('static', filename='img/earth-blue-marble.jpg') }}",
-        bumpImageUrl: "//unpkg.com/three-globe/example/img/earth-topology.png",
-        cloudImageUrl: "//unpkg.com/three-globe/example/img/earth-clouds10k.png",
     };
 </script>
 <!-- 主脚本 -->

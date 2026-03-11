@@ -6,16 +6,55 @@
 
 // ── 从模板注入的配置读取 ────────────────────────────────
 const _cfg = window.APP_CONFIG || {};
-const PRIMARY_COLOR = '#3b82f6';
-const TARGET_COLOR = '#ffffff';
 const TARGET_LOC = { lat: _cfg.serverLat || 0, lng: _cfg.serverLng || 0 };
 const ARC_LIFETIME_MS = (_cfg.arcLifetime || 3600) * 1000;
 const HOME_COUNTRY = _cfg.homeCountry || '中国';
 const FREQUENT_THRESHOLD = _cfg.frequentThreshold || 5;
-const GLOBE_IMAGE_URL = _cfg.globeImageUrl || '';
-const BUMP_IMAGE_URL = _cfg.bumpImageUrl || '//unpkg.com/three-globe/example/img/earth-topology.png';
-const CLOUD_IMAGE_URL = _cfg.cloudImageUrl || '//unpkg.com/three-globe/example/img/earth-clouds10k.png';
 let foreignHighlight = _cfg.foreignHighlight !== false;
+
+// ── 底图亮度自适应调色板 ────────────────────────────────
+let _basemapDark = true;
+const _LIGHT_MAP_KEYWORDS = ['道路', 'road', 'roadmap', '等高线', 'contour'];
+
+function _updateBasemapPalette(name) {
+    const n = (name || '').toLowerCase();
+    const wasDark = _basemapDark;
+    _basemapDark = !_LIGHT_MAP_KEYWORDS.some(k => n.includes(k));
+    return wasDark !== _basemapDark;
+}
+
+function _getLineColors() {
+    if (_basemapDark) {
+        return {
+            blocked: Cesium.Color.fromCssColorString('#ff4444').withAlpha(0.9),
+            foreignActive: Cesium.Color.fromCssColorString('#ff8c00'),
+            domesticActive: Cesium.Color.fromCssColorString('#00e5ff'),
+            foreignHistorical: Cesium.Color.fromCssColorString('#ff8c00').withAlpha(0.9),
+            domesticHistorical: Cesium.Color.fromCssColorString('#00d4ff').withAlpha(0.9),
+            outlineColor: Cesium.Color.BLACK.withAlpha(0.5),
+        };
+    } else {
+        return {
+            blocked: Cesium.Color.fromCssColorString('#cc0000').withAlpha(0.95),
+            foreignActive: Cesium.Color.fromCssColorString('#cc5500'),
+            domesticActive: Cesium.Color.fromCssColorString('#0088bb'),
+            foreignHistorical: Cesium.Color.fromCssColorString('#cc4400').withAlpha(0.95),
+            domesticHistorical: Cesium.Color.fromCssColorString('#0055cc').withAlpha(0.95),
+            outlineColor: Cesium.Color.WHITE.withAlpha(0.7),
+        };
+    }
+}
+
+function _forceLineRedraw() {
+    const toRemove = [];
+    viewer.entities.values.forEach(e => {
+        if (e.id && (e.id.startsWith('arc_') || e.id.startsWith('arcx_'))) {
+            toRemove.push(e);
+        }
+    });
+    toRemove.forEach(e => viewer.entities.remove(e));
+    updateGlobeThreatData();
+}
 
 // ── 自定义对话框 ────────────────────────────────────────
 const customDialog = {
@@ -156,10 +195,16 @@ viewer.baseLayerPicker.container.style.display = 'none';
         if (vm) picker.viewModel.selectedImagery = vm;
     }
 
-    // 每次切换时保存到 localStorage
+    // 初始化底图调色板
+    _updateBasemapPalette(savedName || (imageryVMs.length > 0 ? imageryVMs[0].name : ''));
+
+    // 每次切换时保存到 localStorage，并更新调色板
     picker.viewModel.selectedImageryChanged = new Cesium.Event();
     Cesium.knockout.getObservable(picker.viewModel, 'selectedImagery').subscribe(function(vm) {
-        if (vm && vm.name) localStorage.setItem(STORAGE_KEY, vm.name);
+        if (vm && vm.name) {
+            localStorage.setItem(STORAGE_KEY, vm.name);
+            if (_updateBasemapPalette(vm.name)) _forceLineRedraw();
+        }
     });
 
     // 用 MutationObserver 在下拉框出现时替换英文标签
@@ -190,7 +235,7 @@ window.addEventListener('resize', () => {
 
 const logStream = document.getElementById('log-stream');
 const allLogsStream = document.getElementById('all-logs-stream');
-let attackPointsData = [], attackArcsData = [], attackRingsData = [];
+let attackPointsData = [], attackArcsData = [];
 
 // === 自定义 Fabric 飞线材质 ===
 function FlyingLineMaterialProperty(color, duration) {
@@ -288,14 +333,16 @@ function removeBlockedXMarkers(lineId) {
     });
 }
 
-// === 自适应线宽 (根据相机高度缩放) ===
+// === 自适应线宽 (对数缩放，压缩缩放范围) ===
 function makeAdaptiveWidth(baseWidth) {
     return new Cesium.CallbackProperty(() => {
         const alt = viewer.camera.positionCartographic.height;
-        // 越放大（alt越小）线越细；全球视角（alt~10000km）保持粗线
-        // scale: alt=2e7(全球) -> 2.0, alt=5e6(大陆) -> 1.0, alt=5e5(城市) -> 0.3
-        const scale = Math.min(2.5, Math.max(0.2, alt / 1e7));
-        return baseWidth * scale;
+        // 对数缩放：将巨大的高度范围映射为平缓的线宽变化
+        // 全球(2e7)→1.3x  大陆(5e6)→1.1x  城市(5e5)→0.85x  街道(5e4)→0.7x
+        const logAlt = Math.log10(Math.max(alt, 10000));
+        const t = Math.min(1, Math.max(0, (logAlt - 4.0) / 3.3));
+        const scale = 0.6 + t * 0.8;
+        return Math.max(1.0, baseWidth * scale);
     }, false);
 }
 
@@ -305,13 +352,23 @@ function compute3DArcPositions(lng1, lat1, lng2, lat2, segments) {
     const endCarto = Cesium.Cartographic.fromDegrees(lng2, lat2);
     const geodesic = new Cesium.EllipsoidGeodesic(startCarto, endCarto);
     const dist = geodesic.surfaceDistance;
-    // 越远弧越高，设置最小弧高 120km 就〠距离财子市内也能显示
-    const MIN_HEIGHT = 120000;
-    const rawHeight = dist < 500000 ? dist * 0.3
-                    : dist < 2000000 ? dist * 0.2
-                    : dist * 0.18;
-    const maxHeight = Math.max(rawHeight, MIN_HEIGHT);
-    const segs = segments || (dist < 200000 ? 12 : dist < 500000 ? 20 : dist < 2000000 ? 35 : 50);
+
+    // 极近距离连接（< 500m）：不画弧线
+    if (dist < 500) return null;
+
+    // 根据距离自适应弧高，短距离不设最低高度
+    let maxHeight;
+    if (dist < 50000) {
+        maxHeight = dist * 0.4;          // 50km 内：低弧
+    } else if (dist < 500000) {
+        maxHeight = dist * 0.3;          // 500km 内
+    } else if (dist < 2000000) {
+        maxHeight = dist * 0.2;          // 2000km 内
+    } else {
+        maxHeight = dist * 0.18;         // 远距离
+    }
+
+    const segs = segments || (dist < 50000 ? 8 : dist < 200000 ? 12 : dist < 500000 ? 20 : dist < 2000000 ? 35 : 50);
 
     const positions = [];
     for (let i = 0; i <= segs; i++) {
@@ -410,7 +467,8 @@ function updateGlobeThreatData() {
         }
     });
 
-    // 渲染连线 (3 种线状态: 封禁=X+线段静态, 活跃=流光动画, 历史=静态纯色)
+    // 渲染连线 (3 种线状态: 封禁=X+虚线, 活跃=流光动画, 历史=描边自适应)
+    const _colors = _getLineColors();
     attackArcsData.filter(d => d.arcType === 'base').forEach(d => {
         const lineId = `arc_${d.lng}_${d.lat}`;
         currentIds.add(lineId);
@@ -424,32 +482,37 @@ function updateGlobeThreatData() {
             [0, 1, 2].forEach(i => currentIds.add(`arcx_${lineId}_${i}`));
         }
 
-        let lineColor, material, lineWidth;
+        const isForeign = foreignHighlight && d.country && d.country !== HOME_COUNTRY;
+
+        let material, lineWidth;
         if (blocked) {
-            // 封禁连接：红色虚线 + 沿线三个 X billboard 标记
-            lineColor = Cesium.Color.RED.withAlpha(0.8);
+            // 封禁连接：虚线 + 沿线三个 X billboard 标记
             material = new Cesium.PolylineDashMaterialProperty({
-                color: lineColor,
-                dashLength: 40.0,   // 较长的断居，线段更稀疆
+                color: _colors.blocked,
+                dashLength: 40.0,
                 gapColor: Cesium.Color.TRANSPARENT
             });
-            lineWidth = makeAdaptiveWidth(4);  // 封禁线细了
+            lineWidth = makeAdaptiveWidth(4);
         } else if (active) {
-            // 活跃连接：保持流光动画，绿色
-            lineColor = Cesium.Color.GREEN;
-            material = new FlyingLineMaterialProperty(lineColor, 800 + Math.random() * 500);
-            lineWidth = makeAdaptiveWidth(4);  // 活跃线
+            // 活跃连接：流光动画，境内青色 / 境外橙色
+            const activeColor = isForeign ? _colors.foreignActive : _colors.domesticActive;
+            material = new FlyingLineMaterialProperty(activeColor, 800 + Math.random() * 500);
+            lineWidth = makeAdaptiveWidth(4);
         } else {
-            // 非活跃/历史连接：静态纯色线，无动画
-            const isForeign = foreignHighlight && d.country && d.country !== HOME_COUNTRY;
-            lineColor = isForeign ? Cesium.Color.RED.withAlpha(0.85) : Cesium.Color.fromCssColorString('#60a5fa').withAlpha(0.85);
-            material = new Cesium.ColorMaterialProperty(lineColor);
-            lineWidth = makeAdaptiveWidth(2.5);  // 历史线
+            // 历史连接：带描边的纯色线，境内蓝 / 境外橙
+            const fillColor = isForeign ? _colors.foreignHistorical : _colors.domesticHistorical;
+            material = new Cesium.PolylineOutlineMaterialProperty({
+                color: fillColor,
+                outlineColor: _colors.outlineColor,
+                outlineWidth: 1
+            });
+            lineWidth = makeAdaptiveWidth(5);
         }
 
         const lineEntity = viewer.entities.getById(lineId);
         if (!lineEntity) {
             const arcPositions = compute3DArcPositions(d.lng, d.lat, TARGET_LOC.lng, TARGET_LOC.lat);
+            if (!arcPositions) return; // 同城连接，不画弧线
             const ent = viewer.entities.add({
                 id: lineId,
                 polyline: {
@@ -465,6 +528,7 @@ function updateGlobeThreatData() {
             if (lineEntity._ipState === 'blocked') removeBlockedXMarkers(lineId);
             viewer.entities.remove(lineEntity);
             const arcPositions = compute3DArcPositions(d.lng, d.lat, TARGET_LOC.lng, TARGET_LOC.lat);
+            if (!arcPositions) return; // 同城连接，不画弧线
             const ent = viewer.entities.add({
                 id: lineId,
                 polyline: {
@@ -568,6 +632,7 @@ socket.on('active_init', (list) => {
     });
     document.getElementById('active-count').innerText = activeConnections.size;
     renderActiveTable();
+    updateGlobeThreatData();
 });
 
 socket.on('connection_opened', (data) => {
@@ -580,6 +645,7 @@ socket.on('connection_opened', (data) => {
             desc: data.desc || '', country: data.country || ''
         });
         renderActiveTable();
+        updateGlobeThreatData();
     }
 });
 
@@ -588,6 +654,7 @@ socket.on('connection_closed', (data) => {
     if (data.remote_addr) {
         activeConnections.delete(data.remote_addr);
         renderActiveTable();
+        updateGlobeThreatData();
     }
     addDisconnectLogEntry(data);
 });
@@ -859,7 +926,6 @@ function updateFromData(data) {
         attackArcsData.push(loc._animArc);
     });
 
-    attackRingsData = attackPointsData.slice(-10);
     updateGlobeThreatData();
 }
 
@@ -988,7 +1054,7 @@ function updateHighlightBtn() {
 function toggleForeignHighlight() {
     foreignHighlight = !foreignHighlight;
     updateHighlightBtn();
-    updateFromData(allIpData);
+    _forceLineRedraw();
 }
 updateHighlightBtn();
 
